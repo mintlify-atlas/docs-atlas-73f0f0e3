@@ -1,0 +1,188 @@
+---
+title: "Region management"
+description: "How TiKV partitions key-value data into Regions, and how the Placement Driver manages splits, merges, and replication."
+keywords: ["region", "placement driver", "pd", "split", "merge", "scheduling", "heartbeat", "hot region"]
+---
+
+TiKV splits its key space into contiguous ranges called **Regions**. Regions are the basic unit of data movement, replication, and load balancing in a TiKV cluster. The **Placement Driver (PD)** acts as the cluster manager, collecting information from every TiKV node and issuing scheduling commands to keep the cluster balanced.
+
+## What a Region is
+
+A Region covers a contiguous range of encoded keys `[start_key, end_key)`. Every key in TiKV belongs to exactly one Region at any given time.
+
+Key Region properties from the source:
+
+```rust
+// components/raftstore/src/store/region_meta.rs
+pub struct RegionLocalState {
+    pub id: u64,
+    pub start_key: Vec<u8>,
+    pub end_key: Vec<u8>,
+    pub epoch: Epoch,        // version bumped on split/merge, conf_ver on membership changes
+    pub peers: Vec<RegionPeer>,
+    pub merge_state: Option<RegionMergeState>,
+    pub tablet_index: u64,
+}
+
+pub struct Epoch {
+    pub conf_ver: u64,   // incremented when peer membership changes
+    pub version: u64,    // incremented when the Region splits or merges
+}
+```
+
+The **region epoch** is a version vector. TiKV rejects stale requests that reference an old epoch, ensuring clients always talk to the correct Region after a split or merge.
+
+Each Region is replicated to multiple TiKV nodes (typically three). The replicas form a **Raft group** — one leader handles reads and writes; followers replicate the log. The peer list records which store holds each replica:
+
+```rust
+pub struct RegionPeer {
+    pub id: u64,
+    pub store_id: u64,
+    pub role: RaftPeerRole,   // Voter | Learner | IncomingVoter | DemotingVoter
+    pub is_witness: bool,
+}
+```
+
+<Info>
+The default target Region size is 256 MiB (as of TiKV 8.3+, raised from the older default of 96 MiB). When a Region grows beyond `region-max-size`, TiKV splits it.
+</Info>
+
+## Placement Driver (PD)
+
+PD is a separate service (from the `pingcap/pd` repository) that manages the entire cluster. TiKV nodes periodically report their status to PD through two types of heartbeats.
+
+### Region heartbeats
+
+Each Region leader sends a heartbeat to PD at `pd-heartbeat-tick-interval` (default 1 minute). The heartbeat includes:
+
+- Region metadata (ID, epoch, peers, key range)
+- Approximate Region size and number of keys
+- Leader information and Raft state
+- Read/write statistics (bytes and keys per second)
+
+PD uses this information to track the state of every Region in the cluster and detect problems such as missing replicas or offline peers.
+
+### Store heartbeats
+
+Each TiKV store sends a store heartbeat to PD at `pd-store-heartbeat-tick-interval` (default 10 seconds). The heartbeat includes:
+
+- Total disk capacity and used space
+- Region count and leader count
+- Read/write bandwidth
+- CPU and I/O utilization
+
+PD uses store heartbeats to make placement decisions — for example, avoiding placing new replicas on a nearly-full store.
+
+### Scheduling
+
+Based on heartbeat data, PD issues **operator** commands to TiKV to rebalance the cluster. Common operations include:
+
+<CardGroup cols={2}>
+  <Card title="Add replica" icon="plus">
+    PD detects a Region with fewer replicas than the configured replication factor and instructs a TiKV node to add a peer via Raft `ConfChange`.
+  </Card>
+  <Card title="Remove replica" icon="minus">
+    PD removes excess or failed replicas to meet the replication factor target.
+  </Card>
+  <Card title="Transfer leader" icon="arrow-right-arrow-left">
+    PD moves a Region's Raft leader to a different store to balance leader count across the cluster.
+  </Card>
+  <Card title="Move Region" icon="arrows-up-down-left-right">
+    PD adds a replica on a target store, waits for it to catch up, then removes the replica from the source store — effectively moving the Region.
+  </Card>
+</CardGroup>
+
+## Region split
+
+When a Region grows beyond `region-max-size`, TiKV's split check worker scans the Region and proposes a split via Raft. The split is deterministic: all replicas execute the same split command and arrive at the same division point.
+
+```rust
+// components/raftstore/src/coprocessor/config.rs
+/// When region [a,e) size meets region_max_size, it will be split into
+/// several regions [a,b), [b,c), [c,d), [d,e). And the size of [a,b),
+/// [b,c), [c,d) will be region_split_size (maybe a little larger).
+/// by default, region_max_size = region_split_size * 2 / 3.
+pub region_max_size: Option<ReadableSize>,
+pub region_split_size: Option<ReadableSize>,
+
+// Default split size (TiKV >= 8.3.0)
+pub const SPLIT_SIZE: ReadableSize = ReadableSize::mb(256);
+```
+
+After the split:
+
+- The original Region retains the left half of the key range.
+- A new Region is created for the right half, assigned a new Region ID.
+- Both Regions initially share the same set of peers. PD may subsequently rebalance them independently.
+
+TiKV also supports **table-aware splitting** (`split-region-on-table = true`), which ensures a Region does not span two SQL tables — important for TiDB to push table scans down to a single Region.
+
+## Region merge
+
+PD can merge two adjacent Regions when they are both small (below a configured threshold). Merging reduces the total number of Raft groups and the associated overhead.
+
+The merge process:
+
+<Steps>
+  <Step title="PD proposes a merge">
+    PD detects two adjacent under-sized Regions and sends a merge command to the source Region's leader.
+  </Step>
+  <Step title="Source Region prepares">
+    The source Region replicates a `PrepareMerge` log entry. Its epoch version is incremented and new writes are blocked.
+  </Step>
+  <Step title="Target Region commits the merge">
+    The target Region replicates a `CommitMerge` entry, absorbing the source Region's key range and all its log entries.
+  </Step>
+  <Step title="Source Region is destroyed">
+    Once the `CommitMerge` is applied, the source Region's peers are removed.
+  </Step>
+</Steps>
+
+The `merge_state` field in `RegionLocalState` tracks a Region that is in the middle of a merge.
+
+## Region replication
+
+PD enforces a replication factor (typically 3 or 5) for every Region. When a peer goes offline or a new store is added:
+
+1. PD detects the imbalance through heartbeats.
+2. PD issues an `AddPeer` operator to the Region leader.
+3. The leader sends a Raft snapshot to the new peer.
+4. Once the new peer catches up, PD may issue a `RemovePeer` to remove an excess replica.
+
+<Warning>
+During a rolling upgrade or node replacement, PD may temporarily allow under-replicated Regions. TiKV will not service reads or writes on a Region that has lost quorum.
+</Warning>
+
+## Raft group per Region
+
+Every Region is backed by its own Raft consensus group. This is the fundamental reason TiKV can scale horizontally: adding more stores increases the aggregate number of Region leaders, distributing both storage and CPU load across the cluster.
+
+The `RegionMeta` struct captures the full state of a Region's Raft group at a point in time:
+
+```rust
+// components/raftstore/src/store/region_meta.rs
+pub struct RegionMeta {
+    pub group_state: GroupState,    // Ordered | Chaos | PreChaos | Idle
+    pub raft_status: RaftStatus,    // term, commit index, leader, voter progress
+    pub raft_apply: RaftApplyState, // applied index, truncated state
+    pub region_state: RegionLocalState,
+    pub bucket_keys: Vec<Vec<u8>>,  // sub-Region bucket boundaries
+}
+```
+
+## Hot region scheduling
+
+PD monitors read and write bandwidth per Region through store heartbeats. When a Region's traffic exceeds a threshold, PD marks it as a **hot Region** and schedules it for relief:
+
+- A hot write Region may have its leader moved to a less-loaded store.
+- A hot read Region may have a replica added on a store closer to the client, or its leader transferred.
+
+TiKV's split controller also detects hot Regions locally and proposes a load-based split when QPS exceeds `qps-threshold` (default 3000 QPS) or byte throughput exceeds `byte-threshold` (default 30 MiB/s):
+
+```rust
+// components/raftstore/src/store/worker/split_config.rs
+pub const DEFAULT_QPS_THRESHOLD: usize = 3000;
+pub const DEFAULT_BYTE_THRESHOLD: usize = 30 * 1024 * 1024; // 30 MiB/s
+```
+
+Splitting a hot Region distributes its traffic across the resulting smaller Regions, which PD can then place on different stores.

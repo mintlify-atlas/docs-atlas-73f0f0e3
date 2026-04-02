@@ -1,0 +1,282 @@
+---
+title: "Monitoring"
+description: "How to monitor a TiKV cluster using HTTP status endpoints, Prometheus metrics, Grafana dashboards, and alerting rules."
+keywords: ["monitoring", "prometheus", "grafana", "metrics", "alerting", "status server", "log level"]
+---
+
+TiKV exposes observability through three surfaces: an HTTP status server for real-time queries, a Prometheus metrics endpoint for time-series collection, and structured logs. This page explains how to use each one.
+
+## HTTP status endpoints
+
+Every `tikv-server` process runs a lightweight HTTP status server (default port `20180`). You can query it directly with `curl` or integrate it into health-check scripts.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/status` | Returns HTTP 200 when the server is ready to serve requests. |
+| `GET` | `/metrics` | Returns all Prometheus metrics in text exposition format. |
+| `GET` | `/config` | Returns the current running configuration as JSON. |
+| `POST` | `/config` | Updates configuration values online without restarting. |
+| `PUT` | `/config/reload` | Reloads the configuration from disk. |
+| `GET` | `/region/<id>` | Returns start key and end key for the specified region. |
+| `PUT` | `/log-level` | Changes the log level at runtime. |
+| `GET` | `/resource_groups` | Lists all resource groups and their quota settings. |
+| `GET` | `/debug/pprof/heap` | Downloads a heap profile (jeprof format). |
+| `GET` | `/debug/pprof/profile` | Downloads a 30-second CPU profile. |
+
+<Note>
+The status server supports TLS. When `security.cert-path` and `security.key-path` are configured, all HTTP endpoints require a client certificate.
+</Note>
+
+### Check server readiness
+
+```bash
+curl http://127.0.0.1:20180/status
+```
+
+A `200 OK` response with an empty body means the node is live. Use this endpoint for load-balancer health checks and orchestration readiness probes.
+
+### Fetch running configuration
+
+```bash
+curl http://127.0.0.1:20180/config
+```
+
+### Change log level at runtime
+
+```bash
+curl -X PUT http://127.0.0.1:20180/log-level \
+  -H 'Content-Type: application/json' \
+  -d '{"log_level": "debug"}'
+```
+
+Valid levels are `trace`, `debug`, `info`, `warn`, `error`, and `fatal`.
+
+### Query a region's key range
+
+```bash
+curl http://127.0.0.1:20180/region/1
+```
+
+## Prometheus metrics
+
+TiKV exposes metrics at `GET /metrics` in the Prometheus text exposition format. Configure your Prometheus server to scrape each TiKV node.
+
+```yaml
+scrape_configs:
+  - job_name: tikv
+    static_configs:
+      - targets:
+          - 127.0.0.1:20180
+          - 127.0.0.1:20181
+          - 127.0.0.1:20182
+    metrics_path: /metrics
+    scrape_interval: 15s
+```
+
+<Tip>
+When running TiUP, the topology already wires up Prometheus scrape targets. You only need a manual configuration if you manage Prometheus independently.
+</Tip>
+
+### Key metric categories
+
+<AccordionGroup>
+  <Accordion title="Raft — tikv_raftstore_*">
+    Raft metrics track the health and throughput of the consensus layer.
+
+    | Metric | Description |
+    |--------|-------------|
+    | `tikv_raftstore_raft_process_duration_secs` | Time spent processing Raft ready state. P99 > 2 s indicates a problem. |
+    | `tikv_raftstore_append_log_duration_seconds` | Time to append entries to the Raft log. Spikes indicate disk pressure. |
+    | `tikv_raftstore_apply_log_duration_seconds` | Time to apply committed entries to the state machine. |
+    | `tikv_raftstore_log_lag` | Number of log entries a follower is behind its leader. |
+    | `tikv_raftstore_region_size` | Approximate size of each region. |
+    | `tikv_pd_heartbeat_tick_total` | Count of heartbeat ticks by type (`leader`, `region`). |
+    | `tikv_raftstore_raft_sent_messages_total` | Raft messages sent, broken down by type. |
+  </Accordion>
+
+  <Accordion title="Storage — tikv_storage_*">
+    Storage metrics cover the transaction scheduler and async I/O paths.
+
+    | Metric | Description |
+    |--------|-------------|
+    | `tikv_storage_engine_async_request_duration_seconds` | End-to-end latency for async snapshot and write requests. |
+    | `tikv_storage_command_total` | Count of storage commands by type. |
+    | `tikv_scheduler_latch_wait_duration_seconds` | Time commands spend waiting to acquire a latch. |
+    | `tikv_scheduler_command_duration_seconds` | Total scheduler command execution time. |
+    | `tikv_scheduler_contex_total` | Number of scheduler commands in flight. |
+    | `tikv_scheduler_l0_avg` | Average number of L0 SST files; > 80 may cause write stalls. |
+    | `tikv_store_size_bytes` | Store capacity and available disk space. |
+  </Accordion>
+
+  <Accordion title="Transaction — tikv_txn_*">
+    Transaction metrics reflect the Percolator-style two-phase commit behavior.
+
+    | Metric | Description |
+    |--------|-------------|
+    | `tikv_txn_command_duration_seconds` | Duration of transaction commands (prewrite, commit, rollback). |
+    | `tikv_lock_manager_waited_lock_total` | Locks that required waiting (deadlock detection triggered). |
+    | `tikv_concurrency_manager_max_ts` | The maximum timestamp seen by the concurrency manager. |
+  </Accordion>
+
+  <Accordion title="Coprocessor — tikv_coprocessor_*">
+    Coprocessor metrics measure push-down request execution from TiDB.
+
+    | Metric | Description |
+    |--------|-------------|
+    | `tikv_coprocessor_request_wait_seconds` | Time a coprocessor request spends in the queue. P9999 > 10 s fires an alert. |
+    | `tikv_coprocessor_pending_request` | Pending coprocessor requests by type. |
+    | `tikv_thread_cpu_seconds_total{name=~"cop_.*"}` | CPU seconds consumed by coprocessor threads. |
+  </Accordion>
+
+  <Accordion title="gRPC — tikv_grpc_*">
+    gRPC metrics show RPC traffic between TiKV and its clients.
+
+    | Metric | Description |
+    |--------|-------------|
+    | `tikv_grpc_msg_duration_seconds` | Per-method gRPC request latency. |
+    | `tikv_grpc_msg_fail_total` | Count of failed gRPC messages by type. |
+    | `tikv_grpc_req_batch_size` | Distribution of batch sizes for batch RPC calls. |
+    | `tikv_grpc_resource_group_qps` | QPS broken down by resource group. |
+  </Accordion>
+
+  <Accordion title="RocksDB — tikv_engine_*">
+    RocksDB metrics expose the underlying storage engine behavior.
+
+    | Metric | Description |
+    |--------|-------------|
+    | `tikv_engine_write_stall` | Non-zero values indicate write stalls due to compaction backpressure. |
+    | `tikv_engine_event_total` | RocksDB events (flush, compaction) by column family. |
+    | `tikv_engine_size_bytes` | Size of each column family. |
+  </Accordion>
+</AccordionGroup>
+
+## Grafana dashboards
+
+The `metrics/grafana/` directory in the TiKV repository contains several pre-built Grafana dashboard JSON files.
+
+| File | Purpose |
+|------|---------|
+| `tikv_summary.json` | High-level cluster health: store size, CPU, memory, I/O, QPS, leader and region counts, error rates. Import this first for a quick overview. |
+| `tikv_details.json` | Deep-dive dashboard with sections for Duration, Cluster, Errors, Server, gRPC, Storage, Flow Control, Scheduler, GC, Snapshot, Coprocessor, RocksDB, Titan, Raft I/O, Raft Propose, Raft Process, Backup Log, Resource Control, Encryption, TTL, Threads, and Memory. |
+| `tikv_trouble_shooting.json` | Focused on diagnosing write stalls, latency spikes, and Raft election issues. |
+| `tikv_fast_tune.json` | A compact view for tuning write and read pipelines. |
+| `performance_read.json` | Read-path performance panels. |
+| `performance_write.json` | Write-path performance panels. |
+
+<Note>
+The `tikv_details.json` file is generated from `tikv_details.dashboard.py`. Do not edit the JSON directly — make changes to the Python script and regenerate using `./scripts/gen-tikv-details-dashboard`.
+</Note>
+
+### Import a dashboard
+
+<Steps>
+  <Step title="Open Grafana">
+    Navigate to your Grafana instance and go to **Dashboards → Import**.
+  </Step>
+  <Step title="Upload the JSON file">
+    Select one of the JSON files from `metrics/grafana/` and click **Import**.
+  </Step>
+  <Step title="Select your Prometheus data source">
+    Choose the Prometheus data source that scrapes your TiKV nodes, then confirm.
+  </Step>
+</Steps>
+
+## Alerting rules
+
+The `metrics/alertmanager/` directory provides Prometheus alerting rules. Load `tikv.rules.yml` into your Alertmanager setup.
+
+### Critical alerts
+
+These alerts fire immediately and indicate cluster-level problems that require urgent attention.
+
+| Alert | Expression summary | Meaning |
+|-------|--------------------|---------|
+| `TiKV_critical_error` | `rate(tikv_critical_error_total[1m]) > 0` | A critical internal error occurred. |
+| `TiKV_server_report_failure_msg_total` | `rate(tikv_server_report_failure_msg_total{type="unreachable"}[10m]) > 10` | A store is reporting more than 10 unreachable peers per second. |
+| `TiKV_channel_full_total` | `rate(tikv_channel_full_total[10m]) > 0` | An internal channel is full, causing dropped messages. |
+| `TiKV_write_stall` | `delta(tikv_engine_write_stall[10m]) > 0` | RocksDB write stall is occurring. |
+| `TiKV_maybe_write_stall` | `max(tikv_scheduler_l0_avg) > 80` | L0 SST file count is dangerously high and a stall is likely imminent. |
+| `TiKV_raft_log_lag` | `histogram_quantile(0.99, ...) > 5000` | A follower is more than 5000 log entries behind its leader. |
+| `TiKV_async_request_snapshot_duration_seconds` | P99 snapshot latency > 1 s | Snapshots are taking too long. |
+| `TiKV_async_request_write_duration_seconds` | P99 write latency > 1 s | Writes are taking too long. |
+| `TiKV_coprocessor_request_wait_seconds` | P9999 coprocessor wait > 10 s | Coprocessor queue is severely backed up. |
+| `TiKV_raftstore_thread_cpu_seconds_total` | Raft thread CPU > 1.6 cores | Raft processing is CPU-bound. |
+| `TiKV_raft_append_log_duration_secs` | P99 append latency > 1 s | Disk is slow for Raft log writes. |
+| `TiKV_raft_apply_log_duration_secs` | P99 apply latency > 1 s | State machine application is slow. |
+| `TiKV_scheduler_latch_wait_duration_seconds` | P99 latch wait > 1 s | High lock contention in the scheduler. |
+| `TiKV_thread_apply_worker_cpu_seconds` | Apply thread CPU > 0.9 cores | The apply worker is near saturation. |
+| `TiDB_tikvclient_gc_action_fail` | GC action failures > 10/min | The GC client is failing to perform cleanup. |
+
+### Warning alerts
+
+These alerts indicate conditions that need attention before they become critical.
+
+| Alert | Expression summary | Meaning |
+|-------|--------------------|---------|
+| `TiKV_leader_drops` | `delta(tikv_pd_heartbeat_tick_total{type="leader"}[30s]) < -10` | More than 10 leaders dropped in 30 seconds. |
+| `TiKV_scheduler_context_total` | `abs(delta(tikv_scheduler_contex_total[5m])) > 1000` | Scheduler context count changed by more than 1000 in 5 minutes. |
+| `TiKV_scheduler_command_duration_seconds` | P99 > 1 s | Scheduler commands are slow. |
+| `TiKV_coprocessor_pending_request` | `delta(...[10m]) > 5000` | Coprocessor backlog is growing quickly. |
+| `TiKV_coprocessor_cpu_util` | CPU utilization ≥ 90% | Coprocessor threads are near capacity. |
+| `TiKV_pending_task` | `tikv_worker_pending_task_total > 1000` | A background worker has more than 1000 queued tasks. |
+| `TiKV_low_space` | Available / capacity < 20% | A store is running low on disk space. |
+| `TiKV_approximate_region_size` | P99 region size > 1 GiB | Regions are growing unusually large and may need splitting. |
+| `TiKV_node_restart` | `changes(process_start_time_seconds[5m]) > 0` | A TiKV node restarted in the last 5 minutes. |
+| `TiKV_cpu_quota` | CPU usage > 80% of quota | The node is close to its CPU quota limit. |
+| `TiKV_memory_quota` | RSS > 80% of memory quota | The node is close to its memory quota limit. |
+
+### Emergency alerts
+
+| Alert | Expression summary | Meaning |
+|-------|--------------------|---------|
+| `TiKV_memory_used_too_fast` | RSS grows by > 5 GiB in 5 minutes | Memory is leaking or a large operation is consuming memory at an unsafe rate. |
+| `TiKV_GC_can_not_work` | No GC tasks in 24 hours | Garbage collection has stopped, MVCC versions will accumulate indefinitely. |
+
+## Log configuration
+
+TiKV uses structured logging powered by `slog`. Configure logging in the `[log]` section of `tikv.toml`.
+
+```toml
+[log]
+level = "info"          # trace | debug | info | warn | error | fatal
+format = "text"         # text | json
+enable-timestamp = true
+
+[log.file]
+filename = "/var/log/tikv/tikv.log"
+max-size = 300          # MiB per log file
+max-days = 0            # days to keep rotated files (0 = keep all)
+max-backups = 0         # number of rotated files to keep (0 = keep all)
+```
+
+TiKV also writes a separate slow log for operations that exceed a configurable threshold.
+
+```toml
+# Top-level slow log settings (legacy, outside [log])
+slow-log-file = "/var/log/tikv/tikv-slow.log"
+slow-log-threshold = "1s"
+```
+
+### Change log level without restarting
+
+You can change the log level at runtime using either the HTTP endpoint or the `tikv-ctl` tool.
+
+<Tabs>
+  <Tab title="HTTP">
+    ```bash
+    curl -X PUT http://127.0.0.1:20180/log-level \
+      -H 'Content-Type: application/json' \
+      -d '{"log_level": "debug"}'
+    ```
+  </Tab>
+  <Tab title="tikv-ctl">
+    ```bash
+    tikv-ctl --host 127.0.0.1:20160 modify-tikv-config \
+      -n log-level -v debug
+    ```
+  </Tab>
+</Tabs>
+
+<Warning>
+Setting the log level to `trace` or `debug` in production generates very high log volume and can itself become a performance bottleneck. Revert to `info` once you have finished diagnosing.
+</Warning>

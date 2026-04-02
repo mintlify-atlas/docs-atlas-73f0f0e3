@@ -1,0 +1,134 @@
+---
+title: "Raft consensus"
+description: "How TiKV uses the Raft consensus algorithm to replicate data across nodes and guarantee durability."
+keywords: ["raft", "consensus", "leader election", "log replication", "multiraft", "hibernate regions"]
+---
+
+Raft is the consensus algorithm that TiKV uses to keep data consistent across replicas. Every write must be agreed upon by a majority of peers before it is considered committed, which means TiKV can survive node failures without losing acknowledged writes.
+
+## What Raft does
+
+Raft solves the problem of getting a set of servers to agree on a sequence of values, even when some servers fail or messages are lost. It guarantees:
+
+- **Safety**: a committed entry is never overwritten or lost.
+- **Liveness**: the cluster makes progress as long as a majority of peers are reachable.
+- **Leader completeness**: any newly elected leader holds all committed entries from previous terms.
+
+A Raft group always has exactly one **leader**. Clients send writes only to the leader. Followers replicate the leader's log and vote in elections.
+
+## How TiKV uses Raft
+
+TiKV divides its key space into contiguous ranges called **Regions**. Each Region is an independent Raft group with its own leader and its own replicated log. This design — called **MultiRaft** — means a single TiKV node participates in thousands of Raft groups simultaneously, one per Region it holds.
+
+<Info>
+A typical TiKV deployment runs three or five replicas per Region. Three replicas can survive one failure; five replicas can survive two.
+</Info>
+
+## Log replication flow
+
+<Steps>
+  <Step title="Client sends a write to the Region leader">
+    The gRPC server routes the request to the correct Region's leader peer.
+  </Step>
+  <Step title="Leader appends the entry to its local log">
+    The entry is written to the Raft log engine before replication begins.
+  </Step>
+  <Step title="Leader replicates the entry to followers">
+    The leader sends `MsgAppend` messages to every follower in the group.
+  </Step>
+  <Step title="Followers acknowledge">
+    Each follower appends the entry to its own log and replies with `MsgAppendResponse`.
+  </Step>
+  <Step title="Entry is committed">
+    Once a quorum (majority) has acknowledged, the leader advances the commit index.
+  </Step>
+  <Step title="Entry is applied">
+    The apply thread reads committed entries and writes them to RocksDB. The state machine advances its applied index.
+  </Step>
+  <Step title="Leader responds to the client">
+    After the entry is applied, the callback is invoked and the response is sent back to the client.
+  </Step>
+</Steps>
+
+## Leader election
+
+TiKV drives Raft with periodic **ticks**. The tick interval is controlled by `raft-base-tick-interval` (default `1s`). Two tick-based timers govern elections:
+
+- **Heartbeat timer**: the leader sends heartbeats every `raft-heartbeat-ticks` ticks to prevent followers from starting an election.
+- **Election timeout**: a follower that receives no heartbeat within `raft-election-timeout-ticks` ticks starts an election.
+
+```toml
+# components/raftstore/src/store/config.rs (defaults)
+[raftstore]
+raft-base-tick-interval = "1s"
+raft-heartbeat-ticks = 2        # heartbeat every 2 s
+raft-election-timeout-ticks = 10 # election after 10 s without a heartbeat
+```
+
+When a follower times out, it increments its term, transitions to **candidate**, and broadcasts `MsgRequestVote` to all peers. A peer grants a vote if it has not voted in that term and the candidate's log is at least as up-to-date as its own. The candidate that collects a quorum of votes becomes the new leader and immediately sends heartbeats.
+
+TiKV enables **pre-vote** (`prevote = true`) by default. A pre-candidate first checks that a quorum is reachable before incrementing its term, which prevents unnecessary disruptions when a partitioned node rejoins.
+
+## Raft snapshots
+
+A snapshot transfers the full state of a Region to a lagging or new peer that cannot catch up by log replay alone. Snapshots are triggered when:
+
+- A new peer is added to a Region and has no log at all.
+- A follower has fallen so far behind that the leader has already compacted the log entries the follower needs.
+
+A TiKV snapshot contains the data in the three RocksDB column families that belong to the Region:
+
+```rust
+// components/raftstore/src/store/snap.rs
+pub const SNAPSHOT_CFS: &[CfName] = &[CF_DEFAULT, CF_LOCK, CF_WRITE];
+```
+
+The snapshot is generated asynchronously, streamed to the receiving peer, and applied in the background. Rate limiting (`snap-io-max-bytes-per-sec`, default 100 MB/s) prevents snapshot traffic from saturating the network.
+
+## Hibernate regions
+
+A Region is idle when it has no pending writes or reads. Keeping idle Raft groups ticking wastes CPU. TiKV solves this with **hibernate regions**: when all peers in a group agree to sleep, the leader stops sending heartbeats and followers stop their election timers.
+
+A hibernated group wakes up immediately when a message arrives, such as a write request or a PD scheduling command.
+
+```rust
+// components/raftstore/src/store/hibernate_state.rs
+pub enum GroupState {
+    Ordered,   // actively replicating
+    Chaos,     // leadership uncertain
+    PreChaos,  // transitioning to chaos
+    Idle,      // hibernated
+}
+```
+
+You can disable this optimization with `hibernate-regions = false` in `[raftstore]`, though that is rarely needed.
+
+## MultiRaft
+
+A single TiKV node can host thousands of Regions. Each Region runs its own Raft instance, so a node participates in an equal number of Raft groups. TiKV uses a **batch system** (`components/batch-system`) to multiplex messages across all these groups efficiently, processing them in batches rather than spinning a dedicated thread per Region.
+
+<Tip>
+Because each Region has an independent Raft group, a hot Region does not slow down the consensus of other Regions on the same node.
+</Tip>
+
+## Raft log engine
+
+TiKV stores Raft logs separately from KV data. The **Raft log engine** (`raftdb`) is a dedicated storage layer optimized for sequential append and periodic compaction of old log entries. Separating it from the main KV RocksDB instance reduces write amplification on KV data when the Raft log is compacted.
+
+Log GC runs on a timer (`raft-log-gc-tick-interval`) and removes entries that are no longer needed — entries that have been applied by all peers and are below the compacted index. The threshold is controlled by `raft-log-gc-threshold` (minimum number of log entries to keep) and `raft-log-gc-size-limit`.
+
+<AccordionGroup>
+  <Accordion title="Key raftstore configuration reference">
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `raft-base-tick-interval` | `1s` | Base tick duration for all Raft timers |
+| `raft-heartbeat-ticks` | `2` | Ticks between leader heartbeats |
+| `raft-election-timeout-ticks` | `10` | Ticks before a follower starts an election |
+| `raft-entry-max-size` | `8MiB` | Maximum size of a single Raft entry |
+| `raft-log-gc-threshold` | `50` | Minimum log entries before GC runs |
+| `hibernate-regions` | `true` | Put idle Raft groups to sleep |
+| `snap-io-max-bytes-per-sec` | `100MB` | Snapshot I/O bandwidth limit |
+
+  </Accordion>
+</AccordionGroup>

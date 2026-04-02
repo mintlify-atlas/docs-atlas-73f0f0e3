@@ -1,0 +1,261 @@
+---
+title: "GC and compaction"
+description: "How TiKV garbage-collects stale MVCC versions, how to configure the GC worker, and how RocksDB compaction reclaims disk space."
+keywords: ["GC", "garbage collection", "MVCC", "safe point", "compaction", "RocksDB", "Titan", "disk space", "compaction filter"]
+---
+
+TiKV uses multi-version concurrency control (MVCC) to serve snapshot-isolated reads without blocking writes. Every write creates a new version of a key rather than overwriting the previous one. Over time, old versions accumulate. Garbage collection (GC) removes these stale versions and reclaims disk space. RocksDB compaction physically merges and rewrites SST files, which is when GC actually frees space on disk.
+
+## Why GC is needed
+
+When a transaction commits a value, the previous version is not deleted immediately — a concurrent reader might still need it. TiKV keeps old versions until the GC safe point advances past them. The safe point is a timestamp; any version older than this timestamp is no longer needed by any active transaction and can be deleted.
+
+Without GC, MVCC versions accumulate indefinitely. This manifests as:
+
+- Growing disk usage unrelated to active data size.
+- Slower reads because RocksDB must scan more versions to find the current one.
+- `TiKV_GC_can_not_work` alert firing after 24 hours with no GC activity.
+
+## GC safe point
+
+The GC safe point is a global timestamp managed by PD. Every service that needs to read historical data (such as a running backup or a CDC consumer) registers a **service safe point** with PD using `update_service_gc_safe_point`. PD holds the global safe point at the minimum of all registered service safe points.
+
+The GC worker periodically fetches the current safe point from PD with `get_gc_safe_point` and uses it as the cutoff for deleting old MVCC versions. No version newer than the safe point is ever deleted.
+
+### Safe point and backups
+
+When BR starts a backup, it registers a service safe point at the backup timestamp. This prevents GC from advancing past the backup timestamp and deleting versions that the backup still needs to scan. The hold is released when the backup completes.
+
+## GC worker
+
+Each TiKV store runs a background GC worker (`GcWorker`) that processes GC tasks. The worker receives tasks from the scheduler:
+
+| Task type | Description |
+|-----------|-------------|
+| `Gc` | Scans a key range and deletes MVCC versions older than the safe point. |
+| `GcKeys` | Deletes specific keys' old versions. |
+| `RawGcKeys` | GC for raw key-value mode. |
+| `UnsafeDestroyRange` | Immediately deletes all versions in a key range without scanning (used by DDL drop operations). |
+| `OrphanVersions` | Cleans up orphaned MVCC versions left by incomplete transactions. |
+
+The GC worker monitors the metric `tikv_gcworker_gc_tasks_vec` to track task execution. Check `tikv_gc_compaction_filter_perform` to see how many keys were GC-ed through the compaction filter path.
+
+## GC configuration
+
+Configure GC in the `[gc]` section of `tikv.toml`. All parameters support online change via the HTTP `/config` endpoint.
+
+```toml
+[gc]
+# Ratio of MVCC versions to live rows that triggers GC for a region.
+# A region is skipped if num_versions / num_rows < ratio-threshold.
+# Default: 1.1 (GC when there are 10% more versions than rows).
+ratio-threshold = 1.1
+
+# Number of keys to scan and delete in a single GC batch.
+# Default: 512
+batch-keys = 512
+
+# Maximum write bandwidth for GC deletes, in bytes per second.
+# 0 means no limit. Throttle this in write-heavy clusters to reduce impact.
+# Default: 0 (unlimited)
+max-write-bytes-per-sec = "0"
+
+# Number of GC worker threads.
+# Default: 1
+num-threads = 1
+
+# Enable compaction filter for GC. When true, GC runs inside RocksDB
+# compaction rather than as a separate scan. This is more efficient and
+# is enabled by default since TiKV 5.0.
+enable-compaction-filter = true
+```
+
+### Online configuration change
+
+You can adjust GC settings without restarting TiKV:
+
+```bash
+curl -X POST http://127.0.0.1:20180/config \
+  -H 'Content-Type: application/json' \
+  -d '{"gc.batch-keys": 1024, "gc.max-write-bytes-per-sec": "50MiB"}'
+```
+
+## Compaction filter GC
+
+When `enable-compaction-filter = true`, TiKV installs a custom RocksDB compaction filter (`WriteCompactionFilterFactory`) on the `write` column family. The filter runs during normal RocksDB compaction and deletes stale MVCC versions inline, without a separate GC scan pass.
+
+The compaction filter checks each key against the current GC safe point. If a version is older than the safe point and the `ratio-threshold` condition is satisfied, the version is dropped.
+
+This approach is more efficient than the traditional scan-and-delete path because it:
+- Eliminates a separate read pass over the data.
+- Produces smaller write amplification because deletions happen during a compaction that was already scheduled.
+- Does not generate tombstones that must be compacted away later.
+
+<Note>
+The compaction filter only runs during RocksDB's normal leveled compaction. Regions that are never compacted (because they receive no new writes) may accumulate old versions even with the compaction filter enabled. The traditional GC worker handles such regions.
+</Note>
+
+## Auto compaction
+
+TiKV includes an auto-compaction subsystem that identifies regions where compaction would have the most impact and triggers targeted compactions. Configure it under `[gc.auto-compaction]`.
+
+```toml
+[gc.auto-compaction]
+# How often to check for compaction candidates.
+check-interval = "5m"
+
+# Minimum tombstone count to trigger compaction for a region.
+tombstones-num-threshold = 10000
+
+# Minimum percentage of tombstones relative to total keys.
+tombstones-percent-threshold = 30
+
+# Minimum redundant row count to trigger compaction.
+redundant-rows-threshold = 50000
+
+# Minimum percentage of redundant rows.
+redundant-rows-percent-threshold = 20
+
+# Force compaction of the bottommost SST level.
+bottommost-level-force = false
+
+# Enable MVCC-read-aware compaction: regions with high MVCC version
+# counts during reads get higher compaction priority.
+mvcc-read-aware-enabled = false
+
+# Minimum MVCC versions scanned per request to consider a region "hot".
+mvcc-scan-threshold = 1000
+
+# Weight multiplier for MVCC read activity in compaction scoring.
+# Higher values give more priority to regions with many MVCC scans.
+mvcc-read-weight = 3.0
+```
+
+## Manual compaction with tikv-ctl
+
+You can trigger a compaction manually on a specific TiKV node using `tikv-ctl`.
+
+### Compact a column family on a single node
+
+```bash
+tikv-ctl --host 127.0.0.1:20160 compact \
+  --db kv \
+  --cf default \
+  --from "" \
+  --to ""
+```
+
+The `--db` flag accepts `kv` (the main key-value database) or `raft` (the Raft log database). The `--cf` flag accepts `default`, `write`, or `lock`.
+
+### Compact the whole cluster
+
+```bash
+tikv-ctl --pd 127.0.0.1:2379 compact-cluster \
+  --db kv \
+  --cf write
+```
+
+<Warning>
+Manual compaction consumes significant I/O and CPU on the target node. Schedule manual compactions during maintenance windows or use the `--threads` flag to limit parallelism. Avoid running manual compaction on all nodes simultaneously.
+</Warning>
+
+## RocksDB compaction
+
+TiKV uses RocksDB as its storage engine. RocksDB organizes SST files into levels (L0 through L6). Compaction merges overlapping SST files, removes tombstones, and applies the GC compaction filter.
+
+### Column families
+
+TiKV uses four column families in the KV database:
+
+| Column family | Contents |
+|---------------|----------|
+| `default` | Actual value data for large values (or all values when Titan is disabled). |
+| `write` | MVCC write records — every committed transaction writes here. This CF is GC-heavy. |
+| `lock` | Pessimistic and optimistic transaction locks (short-lived, usually small). |
+| `raft` | Raft log data (in the Raft database, not the KV database). |
+
+### Monitoring compaction health
+
+Watch these metrics to detect compaction problems:
+
+| Metric | What to watch for |
+|--------|-------------------|
+| `tikv_engine_write_stall` | Any non-zero value means RocksDB is throttling writes due to compaction backlog. |
+| `tikv_scheduler_l0_avg` | Average L0 file count; > 80 is a strong indicator of an imminent write stall. |
+| `tikv_engine_event_total{type="compaction"}` | Rate of compaction events by column family. |
+| `tikv_engine_size_bytes` | Size per column family; unexpected growth in `write` CF indicates GC is not keeping up. |
+| `tikv_store_size_bytes{type="available"}` | Available disk space; watch the `TiKV_low_space` alert. |
+
+## Titan GC
+
+Titan is a RocksDB plugin that stores large values in separate blob files instead of the main SST files. This reduces write amplification for workloads with large values.
+
+When TiKV uses Titan, the main SST files contain only small keys and pointers to blob files. Titan runs its own GC to reclaim space in blob files.
+
+### Titan GC configuration
+
+```toml
+[rocksdb.defaultcf.titan]
+# Values larger than min-blob-size are stored in blob files.
+# Default: 32KiB for new instances.
+min-blob-size = "32KiB"
+
+# Compression for blob file data.
+# Default: zstd
+blob-file-compression = "zstd"
+
+# Fraction of a blob file that must be garbage before Titan GC picks it up.
+# Default: 0.5 (50%)
+discardable-ratio = 0.5
+
+# Minimum data to scan in one Titan GC pass.
+# Default: 16MiB
+min-gc-batch-size = "16MiB"
+
+# Maximum data to process in one Titan GC pass.
+# Default: 64MiB
+max-gc-batch-size = "64MiB"
+
+# Titan operating mode: Normal, ReadOnly, or Fallback.
+# ReadOnly disables writes to blob files (use when migrating away from Titan).
+blob-run-mode = "Normal"
+```
+
+### Monitoring Titan GC
+
+The Grafana **Titan** row in `tikv_details.json` provides panels for blob file size, GC flow, write amplification, and blob cache hit rates. Monitor `discardable-ratio` against the configured threshold — if many blob files are above the ratio but Titan GC is not running, check background thread utilization.
+
+<Note>
+Titan GC runs on background threads separate from RocksDB compaction threads. The number of background GC threads is configured automatically based on CPU core count, with a default maximum of 1 thread per node.
+</Note>
+
+## Disk space management
+
+<AccordionGroup>
+  <Accordion title="Monitoring disk usage">
+    Use `tikv_store_size_bytes{type="available"}` and `tikv_store_size_bytes{type="capacity"}` to track disk usage. The `TiKV_low_space` alert fires when available space falls below 20% of capacity.
+
+    The Grafana **Cluster** row in `tikv_summary.json` shows store size, available size, and capacity size panels for a quick overview.
+  </Accordion>
+  <Accordion title="When disk is filling up despite GC running">
+    If disk usage grows even though GC is running, check:
+
+    1. **GC safe point is not advancing** — a long-running backup, CDC consumer, or stale service safe point registration may be holding the safe point. Query the current safe point: `pd-ctl -u http://pd-host:2379 service-gc-safepoint`.
+    2. **Compaction is not running** — the write CF may be accumulating tombstones that are not being compacted. Run a manual compaction on the `write` CF.
+    3. **Titan blob files** — if Titan is enabled and `discardable-ratio` is set too high, blob files accumulate. Lower the ratio or trigger manual Titan GC.
+    4. **Raft log retention** — the Raft log engine retains logs until they are known to be applied and replicated. A lagging follower keeps the log from being truncated. Check `tikv_raftstore_log_lag`.
+  </Accordion>
+  <Accordion title="Reclaiming space after bulk deletes">
+    When a large amount of data is deleted (for example, by dropping a table in TiDB), TiKV writes tombstones but does not immediately free disk space. Space is reclaimed only when compaction runs and processes the tombstones.
+
+    To accelerate reclamation after a bulk delete:
+
+    ```bash
+    tikv-ctl --pd 127.0.0.1:2379 compact-cluster \
+      --db kv \
+      --cf write
+    ```
+
+    This triggers compaction across all nodes in the cluster, which processes the tombstones and frees space.
+  </Accordion>
+</AccordionGroup>

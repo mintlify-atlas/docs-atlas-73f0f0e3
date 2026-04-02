@@ -1,0 +1,205 @@
+---
+title: "MVCC and transactions"
+description: "How TiKV implements multi-version concurrency control and Percolator-style distributed transactions with 2-phase commit."
+keywords: ["mvcc", "transactions", "percolator", "2pc", "snapshot isolation", "pessimistic locking", "gc"]
+---
+
+TiKV provides ACID-compliant distributed transactions by combining Multi-Version Concurrency Control (MVCC) with a two-phase commit protocol inspired by Google's Percolator. Every write creates a new version of a key rather than overwriting the old one, which lets reads see a consistent snapshot without blocking writers.
+
+## MVCC overview
+
+Under MVCC, each key can have multiple versions, each stamped with a **timestamp**. A read at timestamp `T` sees the latest version of every key that was committed before `T`, regardless of any concurrent writes happening after `T`.
+
+This means:
+
+- Reads never block writes.
+- Writers never block readers.
+- Long-running read transactions see a consistent point-in-time view.
+
+Timestamps in TiKV come from the Placement Driver (PD), which issues globally monotonic timestamps (TSO — Timestamp Oracle).
+
+## Version format
+
+TiKV stores versioned data across two RocksDB column families:
+
+- **`CF_DEFAULT`**: stores `(key, start_ts) → value` for values larger than the short-value threshold (64 bytes by default).
+- **`CF_WRITE`**: stores `(key, commit_ts) → WriteRecord`, where `WriteRecord` points back to `start_ts` and carries the write type (`Put`, `Delete`, `Lock`, `Rollback`). Short values are inlined directly into the write record.
+- **`CF_LOCK`**: stores `key → LockInfo` for in-progress transactions.
+
+Keys in `CF_WRITE` and `CF_DEFAULT` are encoded with the timestamp in big-endian byte-reversed form so that newer versions sort before older ones:
+
+```rust
+// Key encoding: raw key + encoded timestamp (descending)
+// From components/txn_types / src/storage/mvcc
+pub use txn_types::{Key, TimeStamp};
+
+// Key::from_raw(b"foo").append_ts(commit_ts)
+// produces the RocksDB key for a specific version
+```
+
+## Transaction model: Percolator-style 2PC
+
+TiKV implements distributed transactions using a **two-phase commit** protocol derived from Google's Percolator paper. Every transaction has:
+
+- A **`start_ts`**: the timestamp at which the transaction began (its read snapshot).
+- A **`commit_ts`**: the timestamp at which the transaction committed (written during phase 2).
+- A **primary key**: one key chosen to act as the transaction coordinator. Its lock record determines whether the transaction committed or rolled back.
+
+### Phase 1: prewrite
+
+The client writes all mutations to TiKV before committing. For each key in the transaction, `prewrite`:
+
+1. Checks that no other transaction has written a commit record with a `commit_ts > start_ts` (write-write conflict detection).
+2. Checks that no other lock exists on the key.
+3. Writes a `Lock` record to `CF_LOCK` containing the `start_ts`, TTL, type, and a pointer to the primary key.
+4. Writes the value to `CF_DEFAULT` (for large values) under `(key, start_ts)`.
+
+```rust
+// src/storage/txn/actions/prewrite.rs
+pub fn prewrite<S: Snapshot>(
+    txn: &mut MvccTxn,
+    reader: &mut SnapshotReader<S>,
+    txn_props: &TransactionProperties<'_>,
+    mutation: Mutation,
+    secondary_keys: &Option<Vec<Vec<u8>>>,
+    pessimistic_action: PrewriteRequestPessimisticAction,
+    expected_for_update_ts: Option<TimeStamp>,
+) -> Result<(TimeStamp, OldValue)>
+```
+
+If any prewrite fails (due to a conflict or an existing lock), the entire transaction is aborted and must be retried.
+
+### Phase 2: commit
+
+Once all prewrites succeed, the client sends a `commit` request:
+
+1. The primary key's lock is replaced with a `Write` record (`WriteType::Put`) in `CF_WRITE` at `commit_ts`.
+2. The lock is deleted from `CF_LOCK`.
+3. Secondary keys are committed asynchronously — their locks are cleaned up lazily or by background tasks.
+
+```rust
+// src/storage/txn/actions/commit.rs
+pub fn commit<S: Snapshot>(
+    txn: &mut MvccTxn,
+    reader: &mut SnapshotReader<S>,
+    key: Key,
+    commit_ts: TimeStamp,
+    commit_role: Option<CommitRole>,
+) -> MvccResult<Option<ReleasedLock>>
+```
+
+The moment the primary key's write record lands, the transaction is durably committed. Any reader that encounters a secondary lock can check the primary to determine whether to roll forward or roll back.
+
+## Transaction isolation levels
+
+TiKV supports two isolation levels:
+
+<CardGroup cols={2}>
+  <Card title="Snapshot isolation (SI)" icon="camera">
+    A transaction reads a consistent snapshot taken at `start_ts`. It will not see any writes committed after `start_ts`. Write-write conflicts are detected at prewrite time. This is the default for optimistic transactions.
+  </Card>
+  <Card title="Read committed (RC)" icon="eye">
+    Each statement within a transaction reads the latest committed data at statement start time. Used in specific TiDB configurations. Reduces conflict rates but relaxes consistency guarantees.
+  </Card>
+</CardGroup>
+
+## Pessimistic locking
+
+In **pessimistic mode**, a transaction acquires row-level locks before reading — equivalent to `SELECT ... FOR UPDATE` in SQL. This avoids the write-write conflict that would cause an optimistic transaction to retry.
+
+```rust
+// src/storage/txn/actions/acquire_pessimistic_lock.rs
+pub fn acquire_pessimistic_lock<S: Snapshot>(
+    txn: &mut MvccTxn,
+    reader: &mut SnapshotReader<S>,
+    key: Key,
+    primary: &[u8],
+    should_not_exist: bool,
+    lock_ttl: u64,
+    for_update_ts: TimeStamp,
+    need_value: bool,
+    // ...
+) -> MvccResult<(PessimisticLockKeyResult, OldValue)>
+```
+
+A pessimistic lock records a `LockType::Pessimistic` entry in `CF_LOCK`. During prewrite, the lock is upgraded in place to a regular lock rather than being created from scratch.
+
+## Optimistic vs pessimistic transactions
+
+| | Optimistic | Pessimistic |
+|---|---|---|
+| Lock acquisition | At prewrite only | At statement execution (`FOR UPDATE`) |
+| Conflict detected | During prewrite | During lock acquisition |
+| Retry scope | Entire transaction | Usually just the conflicting statement |
+| Best for | Low-contention workloads | High-contention workloads |
+
+## Conflict detection and deadlock detection
+
+The **lock manager** tracks which transaction is waiting for which lock. When transaction A is blocked by transaction B's lock, A registers a wait-for relationship with the lock manager.
+
+If a cycle is detected in the wait-for graph (A waits for B, B waits for A), TiKV reports a deadlock error:
+
+```rust
+// src/storage/mvcc/mod.rs
+#[error(
+    "deadlock occurs between txn:{} and txn:{}, lock_key:{}, deadlock_key_hash:{}",
+    .start_ts, .lock_ts,
+    log_wrappers::Value::key(.lock_key),
+    .deadlock_key_hash
+)]
+Deadlock {
+    start_ts: TimeStamp,
+    lock_ts: TimeStamp,
+    lock_key: Vec<u8>,
+    deadlock_key_hash: u64,
+    wait_chain: Vec<kvproto::deadlock::WaitForEntry>,
+},
+```
+
+The deadlock detector runs as a distributed service coordinated through PD, ensuring cycle detection works even when conflicting transactions are on different TiKV nodes.
+
+## MVCC key encoding
+
+Raw user keys are encoded before being stored so that:
+
+1. All versions of the same key sort together.
+2. Within a key, newer versions (higher `commit_ts`) sort before older ones, making it cheap to find the latest version.
+
+The encoding appends the timestamp in **big-endian, bit-flipped** form:
+
+```rust
+// From txn_types::Key
+// Key::from_raw(key).append_ts(ts)
+// ts is encoded as (u64::MAX - ts.into_inner()).to_be_bytes()
+```
+
+This means scanning forward in `CF_WRITE` from `(key, MAX_TS)` to `(key, 0)` retrieves versions from newest to oldest.
+
+## GC: removing old versions
+
+Old versions accumulate over time. The **GC worker** periodically removes versions that are no longer needed by any active transaction — those older than the **GC safe point**.
+
+```rust
+// src/storage/txn/actions/gc.rs
+pub fn gc<'a, S: Snapshot>(
+    txn: &'a mut MvccTxn,
+    reader: &'a mut MvccReader<S>,
+    key: Key,
+    safe_point: TimeStamp,
+) -> MvccResult<GcInfo>
+```
+
+The GC safe point is a globally agreed timestamp managed by PD. Any version with `commit_ts < safe_point` that is not the latest version for its key is eligible for deletion. The `GcInfo` struct tracks how many versions were found and deleted per key:
+
+```rust
+// src/storage/mvcc/txn.rs
+pub struct GcInfo {
+    pub found_versions: usize,
+    pub deleted_versions: usize,
+    pub is_completed: bool,
+}
+```
+
+<Warning>
+Setting the GC safe point too aggressively can cause active long-running transactions to fail if they need to read versions that GC has already removed.
+</Warning>

@@ -1,0 +1,230 @@
+---
+title: "Replication configuration"
+description: "Reference for TiKV Raft replication, region splitting, coprocessor, and GC configuration options."
+keywords: ["tikv", "configuration", "raftstore", "raft", "replication", "region", "gc", "coprocessor"]
+---
+
+This page covers configuration for Raft consensus (`[raftstore]`), region split
+policy (`[coprocessor]`), and garbage collection (`[gc]`).
+
+---
+
+## [raftstore]
+
+The `[raftstore]` section controls Raft timing, log management, and region
+lifecycle behavior. Most timing parameters are expressed in "ticks", where a
+tick equals `raft-base-tick-interval`.
+
+### Raft timing
+
+<ParamField path="raftstore.raft-base-tick-interval" type="duration" default='"1s"'>
+  The base time unit for all Raft tick-based timers. Heartbeats fire every
+  `raft-heartbeat-ticks` ticks; elections time out after
+  `raft-election-timeout-ticks` ticks.
+
+  <Warning>
+    Changing this value affects all other tick-based timers proportionally.
+    Avoid modifying it on a running cluster without careful analysis.
+  </Warning>
+</ParamField>
+
+<ParamField path="raftstore.raft-heartbeat-ticks" type="integer" default="2">
+  Number of base ticks between Raft leader heartbeats. With the default 1-second
+  tick interval, the leader sends heartbeats every 2 seconds. Lower values
+  increase Raft traffic; higher values increase failover detection time.
+</ParamField>
+
+<ParamField path="raftstore.raft-election-timeout-ticks" type="integer" default="10">
+  Number of base ticks a follower waits without a heartbeat before starting a
+  leader election. With the default 1-second tick, the election timeout is
+  10 seconds. Must be greater than `raft-heartbeat-ticks`.
+
+  <Note>
+    TiKV randomizes the actual election timeout between `raft-election-timeout-ticks`
+    and `raft-election-timeout-ticks × 2` to prevent split votes.
+  </Note>
+</ParamField>
+
+### Raft message limits
+
+<ParamField path="raftstore.raft-max-size-per-msg" type="string" default='"1MB"'>
+  Soft limit on the size of a single Raft message. When a batch of log entries
+  exceeds this size, it is split into multiple messages. Larger values increase
+  throughput for write-heavy workloads but consume more memory per message.
+</ParamField>
+
+<ParamField path="raftstore.raft-max-inflight-msgs" type="integer" default="256">
+  Maximum number of in-flight Raft messages that a leader can send to a single
+  follower before waiting for acknowledgment. Higher values increase replication
+  throughput on high-latency links at the cost of more memory.
+</ParamField>
+
+<ParamField path="raftstore.raft-entry-max-size" type="string" default='"8MB"'>
+  Hard limit on the size of a single Raft log entry. Writes that produce an
+  entry larger than this value are rejected with an error. Adjust this value
+  only if your workload legitimately requires very large individual writes.
+</ParamField>
+
+### Raft log GC
+
+<ParamField path="raftstore.raft-log-gc-threshold" type="integer" default="50">
+  Minimum number of compacted Raft log entries required to trigger a GC pass.
+  Must be at least 1. Lower values cause more frequent GC and keep disk usage
+  tighter; higher values reduce GC overhead at the cost of retaining more log
+  entries.
+</ParamField>
+
+<ParamField path="raftstore.raft-log-gc-count-limit" type="integer" default="196608">
+  When the number of uncompacted Raft log entries on a peer exceeds this value,
+  GC is forced regardless of the `raft-log-gc-threshold`. The default is
+  computed relative to `region-split-size`. Reduce this value to free disk space
+  more aggressively on write-heavy clusters.
+</ParamField>
+
+### Region management
+
+<ParamField path="raftstore.region-max-size" type="string">
+  Maximum size a region can reach before TiKV triggers a split check. This
+  option has been moved to `coprocessor.region-max-size`. Configure it there
+  for new deployments.
+</ParamField>
+
+<ParamField path="raftstore.region-split-size" type="string">
+  Target size for each half of a region after a split. This option has been
+  moved to `coprocessor.region-split-size`. Configure it there for new
+  deployments.
+</ParamField>
+
+<ParamField path="raftstore.hibernate-regions" type="boolean" default="true">
+  When enabled, Raft groups with no recent activity enter a hibernation state
+  and stop sending heartbeat messages. This significantly reduces CPU and network
+  overhead in clusters with many idle regions.
+
+  <Note>
+    TiKV automatically wakes hibernated regions when they receive a read or
+    write request, or when a leader election is needed. There is a brief latency
+    increase (one election timeout) when waking a hibernated region.
+  </Note>
+</ParamField>
+
+---
+
+## [coprocessor]
+
+The `[coprocessor]` section controls how TiKV splits regions based on data size
+and key count.
+
+<ParamField path="coprocessor.split-region-on-table" type="boolean" default="false">
+  When set to `true`, TiKV attempts to split regions at table boundaries so that
+  each region belongs to a single TiDB table. This can improve scan performance
+  for table-scoped queries but increases the number of regions and the overhead
+  of scheduling.
+
+  Disable this option (the default) when you expect a large number of tables, to
+  avoid creating too many small regions.
+</ParamField>
+
+<ParamField path="coprocessor.batch-split-limit" type="integer" default="10">
+  Maximum number of split keys produced in a single split check batch. Raising
+  this value allows fewer split-check iterations when a region is significantly
+  over the size limit.
+</ParamField>
+
+<ParamField path="coprocessor.region-max-size" type="string" default='"384MB"'>
+  When a region's data volume exceeds this threshold, TiKV schedules it for
+  splitting. The default of 384 MB is `region-split-size × 3 / 2`.
+
+  ```toml
+  [coprocessor]
+  region-max-size = "384MB"
+  region-split-size = "256MB"
+  ```
+</ParamField>
+
+<ParamField path="coprocessor.region-split-size" type="string" default='"256MB"'>
+  Target size for a region after splitting. Each sub-region produced by a split
+  will be approximately this size (or slightly larger). The default is 256 MB.
+
+  <Tip>
+    Smaller regions improve write parallelism and hot-spot mitigation but
+    increase the total region count and scheduling overhead. Larger regions reduce
+    scheduling pressure but can create hot-spots for range scans.
+  </Tip>
+</ParamField>
+
+<ParamField path="coprocessor.region-max-keys" type="integer">
+  Maximum number of keys a region can hold before a key-count-based split is
+  triggered. By default this is computed as `region-split-size × 10000 / 1MB ×
+  3 / 2`. Set this explicitly to control splits based on key count rather than
+  byte size.
+</ParamField>
+
+---
+
+## [gc]
+
+The `[gc]` section controls Multi-Version Concurrency Control (MVCC) garbage
+collection, which reclaims storage occupied by old transaction versions.
+
+<ParamField path="gc.ratio-threshold" type="float" default="1.1">
+  Ratio of GC-able versions to total versions required to trigger a GC pass for
+  a given key range. A ratio of `1.1` means GC is skipped if less than roughly
+  9% of versions are stale. Increase this value to reduce GC frequency; decrease
+  it to reclaim space more aggressively.
+</ParamField>
+
+<ParamField path="gc.batch-keys" type="integer" default="512">
+  Number of keys processed per GC batch. Larger batches improve GC throughput
+  but hold locks for longer, potentially increasing latency for concurrent
+  writes.
+</ParamField>
+
+<ParamField path="gc.max-write-bytes-per-sec" type="string" default='"0"'>
+  Maximum bytes per second that the GC worker can write to RocksDB. Set to
+  `"0"` to disable rate limiting. Rate limiting GC writes helps protect
+  foreground write performance on I/O-constrained nodes.
+
+  ```toml
+  [gc]
+  max-write-bytes-per-sec = "100MB"
+  ```
+</ParamField>
+
+<ParamField path="gc.enable-compaction-filter" type="boolean" default="true">
+  When enabled, TiKV performs MVCC GC during RocksDB compaction rather than
+  through a separate GC pass. This reduces write amplification and integrates GC
+  naturally with compaction scheduling.
+
+  Disable this only when troubleshooting GC-related issues or when directed by
+  TiKV support.
+</ParamField>
+
+---
+
+## Example configuration
+
+```toml
+[raftstore]
+raft-base-tick-interval = "1s"
+raft-heartbeat-ticks = 2
+raft-election-timeout-ticks = 10
+raft-max-size-per-msg = "1MB"
+raft-max-inflight-msgs = 256
+raft-entry-max-size = "8MB"
+raft-log-gc-threshold = 50
+raft-log-gc-count-limit = 196608
+hibernate-regions = true
+
+[coprocessor]
+split-region-on-table = false
+batch-split-limit = 10
+region-max-size = "384MB"
+region-split-size = "256MB"
+region-max-keys = 3840000
+
+[gc]
+ratio-threshold = 1.1
+batch-keys = 512
+max-write-bytes-per-sec = "0"
+enable-compaction-filter = true
+```

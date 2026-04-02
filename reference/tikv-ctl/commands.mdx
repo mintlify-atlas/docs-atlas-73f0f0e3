@@ -1,0 +1,1197 @@
+---
+title: "tikv-ctl commands"
+description: "Complete reference for every tikv-ctl subcommand, organized by category. Includes syntax, flags, and examples sourced from the TiKV source."
+keywords: ["tikv-ctl", "commands", "subcommands", "reference", "cli"]
+---
+
+All examples assume you have already set `--host` or `--data-dir` as appropriate. See [tikv-ctl overview](/reference/tikv-ctl/overview) for connection details.
+
+## Cluster inspection
+
+### `store`
+
+Prints the store ID and API version of the connected TiKV node.
+
+**Mode**: remote or local
+
+```bash
+tikv-ctl --host 127.0.0.1:20160 store
+```
+
+Example output:
+
+```bash
+store id: 1
+api version: V1
+```
+
+---
+
+### `cluster`
+
+Prints the cluster ID.
+
+**Mode**: remote or local
+
+```bash
+tikv-ctl --host 127.0.0.1:20160 cluster
+```
+
+---
+
+### `raft region`
+
+Prints region metadata stored in Raft state, including local state, apply state, and hard state. You can query one or more regions by ID, all regions, or filter by key range.
+
+**Mode**: remote or local
+
+**Syntax**:
+
+```bash
+tikv-ctl --host <addr> raft region [OPTIONS]
+```
+
+**Flags**:
+
+| Flag | Description |
+|---|---|
+| `-r <id>[,<id>]` | One or more region IDs (comma-separated). |
+| `--all-regions` | Print info for all regions. Conflicts with `-r`. |
+| `--start <hex-key>` | Filter to regions that overlap this hex start key. |
+| `--end <hex-key>` | Filter to regions that overlap this hex end key. |
+| `--limit <n>` | Maximum number of regions to return (default: `16`). |
+| `--skip-tombstone` | Exclude tombstone regions from the output. |
+
+**Examples**:
+
+```bash
+# Inspect a single region
+tikv-ctl --host 127.0.0.1:20160 raft region -r 1
+
+# Inspect multiple regions
+tikv-ctl --host 127.0.0.1:20160 raft region -r 1,2,3
+
+# List all regions, skipping tombstones
+tikv-ctl --data-dir /var/lib/tikv --config /etc/tikv/tikv.toml \
+  raft region --all-regions --skip-tombstone
+```
+
+---
+
+### `raft log`
+
+Prints a single Raft log entry identified by region ID and log index, or by its raw key.
+
+**Mode**: remote or local
+
+**Syntax**:
+
+```bash
+tikv-ctl --host <addr> raft log { -r <region> -i <index> | -k <raw-key> } [-b]
+```
+
+**Flags**:
+
+| Flag | Description |
+|---|---|
+| `-r <region>` | Region ID. Required unless `-k` is provided. |
+| `-i <index>` | Log index. Required unless `-k` is provided. |
+| `-k <raw-key>` | Raw key in escaped form (starts with `z`). Conflicts with `-r`/`-i`. |
+| `-b` | Print entry data as hex instead of decoded protobuf. |
+
+**Example**:
+
+```bash
+tikv-ctl --host 127.0.0.1:20160 raft log -r 1 -i 100
+```
+
+---
+
+### `scan`
+
+Scans MVCC key-value pairs in a range, printing the default, lock, and/or write column family data for each key. Keys must be raw keys in escaped form (generally starting with `z`).
+
+**Mode**: remote or local
+
+<Info>
+  You must provide either `--to` or `--limit`. Omitting both causes an error.
+</Info>
+
+**Syntax**:
+
+```bash
+tikv-ctl --host <addr> scan -f <from> [-t <to>] [--limit <n>] [--show-cf <cf,...>] [--start-ts <ts>] [--commit-ts <ts>]
+```
+
+**Flags**:
+
+| Flag | Default | Description |
+|---|---|---|
+| `-f, --from <key>` | — | Start key in escaped form (required). |
+| `-t, --to <key>` | — | End key in escaped form. |
+| `--limit <n>` | — | Maximum number of keys to return. |
+| `--show-cf <cf,...>` | `default` | Column families to display: `default`, `lock`, `write`. |
+| `--start-ts <ts>` | — | Filter entries by start timestamp. |
+| `--commit-ts <ts>` | — | Filter entries by commit timestamp. |
+
+**Example**:
+
+```bash
+tikv-ctl --host 127.0.0.1:20160 scan -f "\z\x74\x80\x00\x00\x00\x00\x00\x00\xff\x01" --limit 10 --show-cf default,write,lock
+```
+
+---
+
+### `raw-scan`
+
+Scans all raw keys in a range within a single column family, without MVCC decoding.
+
+**Mode**: local only
+
+**Syntax**:
+
+```bash
+tikv-ctl --data-dir <dir> --config <cfg> raw-scan [-f <from>] [-t <to>] [--limit <n>] [--cf <cf>]
+```
+
+**Flags**:
+
+| Flag | Default | Description |
+|---|---|---|
+| `-f, --from <key>` | `""` | Start key in escaped form. |
+| `-t, --to <key>` | `""` | End key in escaped form. |
+| `--limit <n>` | `30` | Maximum number of keys to return. |
+| `--cf <cf>` | `default` | Column family: `default`, `lock`, or `write`. |
+
+**Example**:
+
+```bash
+tikv-ctl --data-dir /var/lib/tikv --config /etc/tikv/tikv.toml \
+  raw-scan --cf write --limit 50
+```
+
+---
+
+### `print`
+
+Prints the raw value for a single key in a column family.
+
+**Mode**: remote or local
+
+**Syntax**:
+
+```bash
+tikv-ctl --host <addr> print -k <raw-key> [-c <cf>]
+```
+
+**Flags**:
+
+| Flag | Default | Description |
+|---|---|---|
+| `-k <key>` | — | Key in escaped form (required). |
+| `-c <cf>` | `default` | Column family: `default`, `lock`, or `write`. |
+
+**Example**:
+
+```bash
+tikv-ctl --host 127.0.0.1:20160 print -k "\z\x74\x80\x00\x00\x00\x00\x00\x00\xff\x01" -c write
+```
+
+---
+
+### `mvcc`
+
+Prints MVCC information for a specific key, showing values across one or more column families, optionally filtered by transaction timestamp.
+
+**Mode**: remote or local
+
+**Syntax**:
+
+```bash
+tikv-ctl --host <addr> mvcc -k <raw-key> [--show-cf <cf,...>] [--start-ts <ts>] [--commit-ts <ts>]
+```
+
+**Flags**:
+
+| Flag | Default | Description |
+|---|---|---|
+| `-k <key>` | — | Key in escaped form (required). |
+| `--show-cf <cf,...>` | `default` | Column families: `default`, `lock`, `write`. |
+| `--start-ts <ts>` | — | Filter by start timestamp. |
+| `--commit-ts <ts>` | — | Filter by commit timestamp. |
+
+**Example**:
+
+```bash
+tikv-ctl --host 127.0.0.1:20160 mvcc -k "\z\x74\x80\x00\x00\x00\x00\x00\x00\xff\x01" \
+  --show-cf default,write,lock
+```
+
+---
+
+### `size`
+
+Prints the approximate size of a region (or all regions) in one or more column families.
+
+**Mode**: remote or local
+
+**Syntax**:
+
+```bash
+tikv-ctl --host <addr> size [-r <region>] [-c <cf,...>]
+```
+
+**Flags**:
+
+| Flag | Default | Description |
+|---|---|---|
+| `-r <region>` | — | Region ID. If omitted, prints all regions. |
+| `-c <cf,...>` | `default,write,lock` | Column families (comma-separated). |
+
+**Example**:
+
+```bash
+# Size of region 1 across all CFs
+tikv-ctl --host 127.0.0.1:20160 size -r 1
+
+# Size of all regions in the write CF
+tikv-ctl --host 127.0.0.1:20160 size -c write
+```
+
+---
+
+### `region-properties`
+
+Prints RocksDB properties for a specific region, such as key count and data size.
+
+**Mode**: remote or local
+
+**Syntax**:
+
+```bash
+tikv-ctl --host <addr> region-properties -r <region>
+```
+
+**Example**:
+
+```bash
+tikv-ctl --host 127.0.0.1:20160 region-properties -r 1
+```
+
+---
+
+### `range-properties`
+
+Prints RocksDB properties for a key range.
+
+**Mode**: remote or local
+
+**Syntax**:
+
+```bash
+tikv-ctl --host <addr> range-properties [--start <hex-key>] [--end <hex-key>]
+```
+
+**Flags**:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--start <hex>` | `""` | Hex start key (without the `z` prefix). |
+| `--end <hex>` | `""` | Hex end key (without the `z` prefix). |
+
+**Example**:
+
+```bash
+tikv-ctl --host 127.0.0.1:20160 range-properties --start 7480000000000000ff01 --end 7480000000000000ff02
+```
+
+---
+
+### `diff`
+
+Compares region data between two TiKV instances (by host or data directory) and reports keys that differ.
+
+**Mode**: local source, remote or local target
+
+**Syntax**:
+
+```bash
+tikv-ctl --data-dir <dir> --config <cfg> diff -r <region> \
+  { --to-host <addr> | --to-data-dir <dir> [--to-config <cfg>] }
+```
+
+**Flags**:
+
+| Flag | Description |
+|---|---|
+| `-r <region>` | Region ID to compare (required). |
+| `--to-host <addr>` | Remote TiKV address to diff against. |
+| `--to-data-dir <dir>` | Data directory of the target TiKV. |
+| `--to-config <cfg>` | Config file of the target TiKV (used with `--to-data-dir`). |
+
+**Example**:
+
+```bash
+tikv-ctl --data-dir /var/lib/tikv --config /etc/tikv/tikv.toml \
+  diff -r 1 --to-host 127.0.0.1:20161
+```
+
+---
+
+### `bad-regions`
+
+Lists all regions on the local node that have Raft state corruption.
+
+**Mode**: local only
+
+```bash
+tikv-ctl --data-dir /var/lib/tikv --config /etc/tikv/tikv.toml bad-regions
+```
+
+---
+
+### `bad-ssts`
+
+Finds SST files listed in the MANIFEST that are corrupted or missing, by cross-referencing PD region data.
+
+**Mode**: local only
+
+**Syntax**:
+
+```bash
+tikv-ctl --data-dir <dir> --config <cfg> bad-ssts --pd <pd-addr> [--manifest <path>]
+```
+
+**Flags**:
+
+| Flag | Description |
+|---|---|
+| `--pd <addr>` | PD endpoint (required). |
+| `--manifest <path>` | Path to a specific MANIFEST file. If omitted, tikv-ctl locates it automatically. |
+
+**Example**:
+
+```bash
+tikv-ctl --data-dir /var/lib/tikv --config /etc/tikv/tikv.toml \
+  bad-ssts --pd 127.0.0.1:2379
+```
+
+---
+
+### `get-region-read-progress`
+
+Prints the `RegionReadProgress` and resolver state for a region. Useful for diagnosing stalled resolved timestamps in CDC or Stale Read workloads.
+
+**Mode**: remote only
+
+**Syntax**:
+
+```bash
+tikv-ctl --host <addr> get-region-read-progress -r <region> [--log] [--min-start-ts <ts>]
+```
+
+**Flags**:
+
+| Flag | Description |
+|---|---|
+| `-r, --region <id>` | Target region ID (required). |
+| `--log` | Also print the locks held by the transaction that is blocking `resolved_ts` from advancing. |
+| `--min-start-ts <ts>` | Only record transactions whose `start_ts` is at or above this value. Requires `--log`. |
+
+**Example**:
+
+```bash
+tikv-ctl --host 127.0.0.1:20160 get-region-read-progress -r 1 --log
+```
+
+---
+
+## Data management
+
+### `compact`
+
+Triggers a manual RocksDB compaction on a single node for a given column family and optional key range. You can target a specific region instead of an explicit key range.
+
+**Mode**: remote or local
+
+**Syntax**:
+
+```bash
+tikv-ctl --host <addr> compact [-d <db>] [-c <cf>] [-f <from>] [-t <to>] [-r <region>] [-n <threads>] [-b <bottommost>]
+```
+
+**Flags**:
+
+| Flag | Default | Description |
+|---|---|---|
+| `-d <db>` | `kv` | Database: `kv` or `raft`. |
+| `-c <cf>` | `default` | Column family: `default`, `lock`, or `write`. |
+| `-f, --from <key>` | — | Start key in escaped form. |
+| `-t, --to <key>` | — | End key in escaped form. |
+| `-r <region>` | — | Compact the key range of this region ID. |
+| `-n, --threads <n>` | `8` | Number of threads to use for compaction. |
+| `-b, --bottommost <mode>` | `default` | Bottommost level strategy: `skip`, `force`, or `default`. |
+
+**Example**:
+
+```bash
+# Compact the write CF on a running node
+tikv-ctl --host 127.0.0.1:20160 compact -d kv -c write
+
+# Compact the key range of region 1 with 4 threads
+tikv-ctl --host 127.0.0.1:20160 compact -c default -r 1 -n 4
+```
+
+---
+
+### `compact-cluster`
+
+Triggers a manual RocksDB compaction on every TiKV node in the cluster simultaneously. Requires PD to enumerate all stores.
+
+**Mode**: remote (contacts PD)
+
+<Warning>
+  `compact-cluster` issues compaction requests to every TiKV node at the same time. On large clusters this can significantly increase I/O load. Run during low-traffic windows.
+</Warning>
+
+**Syntax**:
+
+```bash
+tikv-ctl --pd <pd-addr> compact-cluster [-d <db>] [-c <cf,...>] [-f <from>] [-t <to>] [-n <threads>] [-b <bottommost>]
+```
+
+**Flags**:
+
+| Flag | Default | Description |
+|---|---|---|
+| `-d <db>` | `kv` | Database: `kv` or `raft`. |
+| `-c <cf,...>` | `default` | Column families (comma-separated). |
+| `-f, --from <key>` | — | Start key in escaped form. |
+| `-t, --to <key>` | — | End key in escaped form. |
+| `-n, --threads <n>` | `8` | Number of threads per node compaction. |
+| `-b, --bottommost <mode>` | `default` | Bottommost level strategy: `skip`, `force`, or `default`. |
+
+**Example**:
+
+```bash
+tikv-ctl --pd 127.0.0.1:2379 compact-cluster -d kv -c default,write,lock -n 4
+```
+
+---
+
+### `tombstone`
+
+Marks one or more regions as tombstone on the local node. This is used after manually removing a peer from a region to prevent the old peer from interfering with Raft consensus.
+
+**Mode**: local only
+
+<Warning>
+  Setting a region to tombstone is irreversible. Confirm the region is no longer needed on this store before proceeding.
+</Warning>
+
+**Syntax**:
+
+```bash
+tikv-ctl --data-dir <dir> --config <cfg> tombstone -r <region>[,<region>] { -p <pd-addr>[,<pd-addr>] | --force }
+```
+
+**Flags**:
+
+| Flag | Description |
+|---|---|
+| `-r <id>[,<id>]` | Region IDs to tombstone (comma-separated, required). |
+| `-p <pd-addr>[,<pd-addr>]` | PD endpoints. tikv-ctl verifies the region is no longer assigned to this store before setting tombstone. |
+| `--force` | Skip PD verification. Use only when PD is unavailable. |
+
+**Examples**:
+
+```bash
+# Safe: verify with PD before tombstoning
+tikv-ctl --data-dir /var/lib/tikv --config /etc/tikv/tikv.toml \
+  tombstone -r 1,2,3 -p 127.0.0.1:2379
+
+# Forced: skip PD verification
+tikv-ctl --data-dir /var/lib/tikv --config /etc/tikv/tikv.toml \
+  tombstone -r 5 --force
+```
+
+---
+
+### `recover-mvcc`
+
+Recovers MVCC data on a local node by scanning for and deleting corrupted keys. You can target specific regions or the entire database.
+
+**Mode**: local only
+
+<Warning>
+  This command deletes data. Run with `--read-only` first to preview which keys would be removed, then run without it to apply changes.
+</Warning>
+
+**Syntax**:
+
+```bash
+tikv-ctl --data-dir <dir> --config <cfg> recover-mvcc \
+  { -a [--threads <n>] | -r <region>[,<region>] -p <pd-addr>[,<pd-addr>] } \
+  [-R]
+```
+
+**Flags**:
+
+| Flag | Default | Description |
+|---|---|---|
+| `-a, --all` | — | Recover the entire database instead of specific regions. |
+| `--threads <n>` | `4` | Number of worker threads (only valid with `--all`). |
+| `-r <id>[,<id>]` | — | Region IDs to recover (required unless `--all` is set). |
+| `-p <pd-addr>[,<pd-addr>]` | — | PD endpoints (required unless `--all` is set). |
+| `-R, --read-only` | `false` | Scan and report corrupted keys without deleting them. |
+
+**Examples**:
+
+```bash
+# Preview corrupted keys in region 1
+tikv-ctl --data-dir /var/lib/tikv --config /etc/tikv/tikv.toml \
+  recover-mvcc -r 1 -p 127.0.0.1:2379 --read-only
+
+# Recover the whole database with 8 threads
+tikv-ctl --data-dir /var/lib/tikv --config /etc/tikv/tikv.toml \
+  recover-mvcc --all --threads 8
+```
+
+---
+
+### `unsafe-recover remove-fail-stores`
+
+Removes failed store peers from region membership lists on the local node. Use this when a subset of stores in a Raft group are permanently lost and the remaining peers need to form a new quorum.
+
+**Mode**: local only
+
+<Warning>
+  This operation may cause data loss. It forcibly rewrites region peer lists. Use it only as a last resort when failed stores are unrecoverable and the cluster cannot restart normally.
+</Warning>
+
+**Syntax**:
+
+```bash
+tikv-ctl --data-dir <dir> --config <cfg> unsafe-recover remove-fail-stores \
+  -s <store>[,<store>] \
+  { -r <region>[,<region>] | --all-regions } \
+  [--promote-learner]
+```
+
+**Flags**:
+
+| Flag | Description |
+|---|---|
+| `-s <id>[,<id>]` | Store IDs to remove from peer lists (comma-separated, required). |
+| `-r <id>[,<id>]` | Restrict the operation to these region IDs. |
+| `--all-regions` | Apply to all regions on the store. Conflicts with `-r`. |
+| `--promote-learner` | Promote learner peers to voters when removing fail stores. |
+
+**Example**:
+
+```bash
+tikv-ctl --data-dir /var/lib/tikv --config /etc/tikv/tikv.toml \
+  unsafe-recover remove-fail-stores -s 2,3 --all-regions
+```
+
+---
+
+### `unsafe-recover drop-unapplied-raftlog`
+
+Removes unapplied Raft log entries from the specified regions. Use this when a region's Raft log is corrupted and the node cannot start.
+
+**Mode**: local only
+
+<Warning>
+  Dropping unapplied Raft log entries may cause committed-but-unapplied writes to be lost.
+</Warning>
+
+**Syntax**:
+
+```bash
+tikv-ctl --data-dir <dir> --config <cfg> unsafe-recover drop-unapplied-raftlog \
+  { -r <region>[,<region>] | --all-regions }
+```
+
+**Flags**:
+
+| Flag | Description |
+|---|---|
+| `-r <id>[,<id>]` | Region IDs to process (comma-separated). |
+| `--all-regions` | Apply to all regions. Conflicts with `-r`. |
+
+**Example**:
+
+```bash
+tikv-ctl --data-dir /var/lib/tikv --config /etc/tikv/tikv.toml \
+  unsafe-recover drop-unapplied-raftlog -r 1,2
+```
+
+---
+
+### `recreate-region`
+
+Recreates a region on the local node using metadata fetched from PD, but assigns a new region ID and peer ID. Use this to bootstrap a region on a node that has lost its local region state.
+
+**Mode**: local only
+
+**Syntax**:
+
+```bash
+tikv-ctl --data-dir <dir> --config <cfg> recreate-region -r <region> -p <pd-addr>[,<pd-addr>]
+```
+
+**Flags**:
+
+| Flag | Description |
+|---|---|
+| `-r <region>` | The original region ID (required). |
+| `-p <pd-addr>[,<pd-addr>]` | PD endpoints (required). |
+
+**Example**:
+
+```bash
+tikv-ctl --data-dir /var/lib/tikv --config /etc/tikv/tikv.toml \
+  recreate-region -r 1 -p 127.0.0.1:2379
+```
+
+---
+
+### `reset-to-version`
+
+Resets all data in the TiKV node to a given MVCC version by deleting any writes with a commit timestamp greater than the specified version.
+
+**Mode**: remote or local
+
+<Warning>
+  This command permanently deletes data newer than the target version. It cannot be undone. Ensure you have a backup before running it.
+</Warning>
+
+**Syntax**:
+
+```bash
+tikv-ctl --host <addr> reset-to-version -v <version>
+```
+
+**Flags**:
+
+| Flag | Description |
+|---|---|
+| `-v <version>` | The MVCC timestamp version to reset to (required). |
+
+**Example**:
+
+```bash
+tikv-ctl --host 127.0.0.1:20160 reset-to-version -v 415706554367844352
+```
+
+---
+
+### `flashback`
+
+Flashes back all cluster data to a specific MVCC version across every region in the cluster. Before running this command, halt PD scheduling with `pd-ctl config set halt-scheduling true`.
+
+**Mode**: remote (contacts PD)
+
+<Warning>
+  `flashback` rewrites live data across the entire cluster. It cannot be undone. Halt PD scheduling before running and restore it after.
+</Warning>
+
+**Syntax**:
+
+```bash
+tikv-ctl --pd <pd-addr> flashback -v <version> \
+  [-r <region>[,<region>]] \
+  [--start <hex-key>] [--end <hex-key>]
+```
+
+**Flags**:
+
+| Flag | Default | Description |
+|---|---|---|
+| `-v <version>` | — | Target MVCC version (required). |
+| `-r <id>[,<id>]` | — | Restrict flashback to these region IDs. |
+| `--start <hex>` | `""` | Hex start key boundary. |
+| `--end <hex>` | `""` | Hex end key boundary. |
+
+**Example**:
+
+```bash
+# Halt scheduling first
+pd-ctl config set halt-scheduling true
+
+tikv-ctl --pd 127.0.0.1:2379 flashback -v 415706554367844352
+
+# Restore scheduling after
+pd-ctl config set halt-scheduling false
+```
+
+---
+
+### `split-region`
+
+Splits a region at a specified key by sending a split request to the region leader.
+
+**Mode**: remote (contacts PD to locate leader)
+
+**Syntax**:
+
+```bash
+tikv-ctl --pd <pd-addr> split-region -r <region> -k <key>
+```
+
+**Flags**:
+
+| Flag | Description |
+|---|---|
+| `-r <region>` | Region ID to split (required). |
+| `-k <key>` | Split key in unencoded escaped format (required). |
+
+**Example**:
+
+```bash
+tikv-ctl --pd 127.0.0.1:2379 split-region -r 1 -k "\x74\x80\x00\x00\x00\x00\x00\x00\xff\x01"
+```
+
+---
+
+## Snapshot management
+
+### `dump-snap-meta`
+
+Parses and prints the contents of a TiKV snapshot metadata file (`*.meta`), including the column families, sizes, and checksums of each SST file in the snapshot.
+
+**Mode**: standalone (no `--host` or `--data-dir` required)
+
+**Syntax**:
+
+```bash
+tikv-ctl dump-snap-meta -f <path>
+```
+
+**Flags**:
+
+| Flag | Description |
+|---|---|
+| `-f, --file <path>` | Path to the snapshot meta file (required). |
+
+**Example**:
+
+```bash
+tikv-ctl dump-snap-meta -f /var/lib/tikv/snap/gen_1_1_1.meta
+```
+
+---
+
+## Data import and export
+
+### `sst_dump` (external)
+
+Wraps the RocksDB `sst_dump` tool to inspect SST file contents. Pass all arguments after the subcommand name.
+
+**Mode**: standalone
+
+**Syntax**:
+
+```bash
+tikv-ctl sst_dump [rocksdb-sst-dump-args...]
+```
+
+**Example**:
+
+```bash
+tikv-ctl sst_dump --command=scan --file=/var/lib/tikv/db/000123.sst --output_hex
+```
+
+---
+
+### `ldb` (external)
+
+Wraps the RocksDB `ldb` tool for low-level database inspection. Pass all arguments after the subcommand name.
+
+**Mode**: standalone
+
+**Syntax**:
+
+```bash
+tikv-ctl ldb [rocksdb-ldb-args...]
+```
+
+**Example**:
+
+```bash
+tikv-ctl ldb scan --db=/var/lib/tikv/db --hex --from=z --to=zz
+```
+
+---
+
+### `encryption-meta dump-key`
+
+Dumps data encryption keys from the key dictionary. The output contains plaintext key material.
+
+**Mode**: local only
+
+<Warning>
+  This command prints encryption keys as plaintext. Do not redirect the output to a file on disk. Use it only in secure, ephemeral environments.
+</Warning>
+
+**Syntax**:
+
+```bash
+tikv-ctl --data-dir <dir> --config <cfg> encryption-meta dump-key [--ids <id>[,<id>]]
+```
+
+**Flags**:
+
+| Flag | Description |
+|---|---|
+| `--ids <id>[,<id>]` | Data key IDs to dump. If omitted, dumps all keys. |
+
+**Example**:
+
+```bash
+tikv-ctl --data-dir /var/lib/tikv --config /etc/tikv/tikv.toml \
+  encryption-meta dump-key --ids 1,2
+```
+
+---
+
+### `encryption-meta dump-file`
+
+Prints the encryption metadata (method, key ID, IV) for files tracked by the key manager.
+
+**Mode**: local only
+
+**Syntax**:
+
+```bash
+tikv-ctl --data-dir <dir> --config <cfg> encryption-meta dump-file [--path <path>]
+```
+
+**Flags**:
+
+| Flag | Description |
+|---|---|
+| `--path <path>` | Path to a specific file. If omitted, dumps metadata for all tracked files. |
+
+**Example**:
+
+```bash
+tikv-ctl --data-dir /var/lib/tikv --config /etc/tikv/tikv.toml \
+  encryption-meta dump-file --path /var/lib/tikv/db/CURRENT
+```
+
+---
+
+### `decrypt-file`
+
+Decrypts an encrypted TiKV file and writes the plaintext to an output file.
+
+**Mode**: local only
+
+<Warning>
+  This command writes sensitive data as plaintext to persistent storage. Ensure the output path is secure and delete the plaintext file as soon as you are done.
+</Warning>
+
+**Syntax**:
+
+```bash
+tikv-ctl --data-dir <dir> --config <cfg> decrypt-file --file <input> --out-file <output>
+```
+
+**Flags**:
+
+| Flag | Description |
+|---|---|
+| `--file <path>` | Path to the encrypted input file (required). |
+| `--out-file <path>` | Path to write the decrypted output (required). |
+
+**Example**:
+
+```bash
+tikv-ctl --data-dir /var/lib/tikv --config /etc/tikv/tikv.toml \
+  decrypt-file --file /var/lib/tikv/db/000123.sst --out-file /tmp/000123-decrypted.sst
+```
+
+---
+
+### `cleanup-encryption-meta`
+
+Removes encryption keys from the key dictionary that are no longer associated with any physical file. Run this after deleting stale data files to keep the key dictionary compact.
+
+**Mode**: local only
+
+```bash
+tikv-ctl --data-dir /var/lib/tikv --config /etc/tikv/tikv.toml cleanup-encryption-meta
+```
+
+---
+
+### `compact-log-backup`
+
+Compacts log backup files stored in external storage (S3, GCS, Azure Blob) into optimized SST files. Used to reduce the restore time of PITR (point-in-time recovery) backups.
+
+**Mode**: standalone (requires `--config` for RocksDB options)
+
+**Syntax**:
+
+```bash
+tikv-ctl --config <cfg> compact-log-backup \
+  --from <ts> --until <ts> \
+  -s <storage-base64> \
+  [-N <concurrency>] \
+  [--name <name>] \
+  [--compression <method>] \
+  [--compression-level <level>] \
+  [--minimal-compaction-size <size>] \
+  [--force-regenerate]
+```
+
+**Flags**:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--from <ts>` | — | Start timestamp (inclusive, required). |
+| `--until <ts>` | — | End timestamp (exclusive, required). |
+| `-s, --storage-base64 <b64>` | — | Base64-encoded `StorageBackend` protobuf. Generate with `br` CLI (required). |
+| `-N, --concurrency <n>` | `32` | Maximum concurrent sub-compactions. |
+| `--name <name>` | `compaction` | Name label for this compaction run. |
+| `--compression <method>` | `lz4` | SST compression: `lz4`, `zstd`, or `snappy`. |
+| `--compression-level <n>` | — | Compression level (algorithm-specific). |
+| `--minimal-compaction-size <size>` | `16M` | Skip regions whose backup data is smaller than this threshold. |
+| `--prefetch-running-count <n>` | `128` | Maximum concurrent metadata download tasks. |
+| `--prefetch-buffer-count <n>` | `1024` | Maximum buffered metadata download tasks. |
+| `--force-regenerate` | `false` | Ignore checkpoints and re-run all compactions. |
+
+---
+
+### `raft-engine-ctl`
+
+Passes arguments directly to the embedded `raft-engine-ctl` utility for low-level inspection and repair of the Raft Engine log files.
+
+**Mode**: local only
+
+**Syntax**:
+
+```bash
+tikv-ctl --data-dir <dir> --config <cfg> raft-engine-ctl -- <raft-engine-ctl-args>
+```
+
+**Example**:
+
+```bash
+tikv-ctl --data-dir /var/lib/tikv --config /etc/tikv/tikv.toml \
+  raft-engine-ctl -- --help
+```
+
+---
+
+## Utilities
+
+### `modify-tikv-config`
+
+Dynamically modifies a TiKV configuration value at runtime without restarting the server. The config name uses the same dotted path as the TOML config file.
+
+**Mode**: remote only
+
+**Syntax**:
+
+```bash
+tikv-ctl --host <addr> modify-tikv-config -n <config-name> -v <config-value>
+```
+
+**Flags**:
+
+| Flag | Description |
+|---|---|
+| `-n <name>` | Dotted config path (e.g. `rocksdb.defaultcf.disable-auto-compactions`). |
+| `-v <value>` | New value (e.g. `true`, `8`, `1h`, `8MB`). |
+
+**Examples**:
+
+```bash
+# Disable auto-compactions on the default CF
+tikv-ctl --host 127.0.0.1:20160 \
+  modify-tikv-config -n rocksdb.defaultcf.disable-auto-compactions -v true
+
+# Increase max background jobs for the Raft DB
+tikv-ctl --host 127.0.0.1:20160 \
+  modify-tikv-config -n raftdb.max-background-jobs -v 8
+```
+
+---
+
+### `metrics`
+
+Prints metrics from the connected TiKV node in the selected format.
+
+**Mode**: remote only
+
+**Syntax**:
+
+```bash
+tikv-ctl --host <addr> metrics [-t <tag>[,<tag>]]
+```
+
+**Flags**:
+
+| Flag | Default | Description |
+|---|---|---|
+| `-t, --tag <tag,...>` | `prometheus` | Metrics source: `prometheus`, `jemalloc`, `rocksdb_raft`, `rocksdb_kv`. |
+
+**Examples**:
+
+```bash
+# Print Prometheus metrics
+tikv-ctl --host 127.0.0.1:20160 metrics
+
+# Print jemalloc and RocksDB KV metrics together
+tikv-ctl --host 127.0.0.1:20160 metrics -t jemalloc,rocksdb_kv
+```
+
+---
+
+### `fail inject`
+
+Injects failpoints into a running TiKV node. This is a testing tool for simulating failures.
+
+**Mode**: remote only
+
+<Warning>
+  Injecting failpoints into a production cluster can cause data unavailability, crashes, or data loss. Use only in test environments.
+</Warning>
+
+**Syntax**:
+
+```bash
+tikv-ctl --host <addr> fail inject [<point>=<action> ...] [-f <file>]
+```
+
+**Flags**:
+
+| Flag | Description |
+|---|---|
+| `<point>=<action>` | Failpoint name and action pairs (e.g. `raft_before_save=panic`). |
+| `-f <file>` | Read failpoint/action pairs from a file (one `name=action` per line). |
+
+**Example**:
+
+```bash
+tikv-ctl --host 127.0.0.1:20160 fail inject raft_before_save=panic
+```
+
+---
+
+### `fail recover`
+
+Recovers (removes) previously injected failpoints from a running TiKV node.
+
+**Mode**: remote only
+
+**Syntax**:
+
+```bash
+tikv-ctl --host <addr> fail recover [<point> ...] [-f <file>]
+```
+
+**Example**:
+
+```bash
+tikv-ctl --host 127.0.0.1:20160 fail recover raft_before_save
+```
+
+---
+
+### `fail list`
+
+Lists all currently active failpoints on the node.
+
+**Mode**: remote only
+
+```bash
+tikv-ctl --host 127.0.0.1:20160 fail list
+```
+
+---
+
+### `consistency-check`
+
+Requests the TiKV node to verify the data consistency of a specific region. The node checks that the hash of keys in the Raft apply log matches the actual RocksDB data.
+
+**Mode**: remote only
+
+**Syntax**:
+
+```bash
+tikv-ctl --host <addr> consistency-check -r <region>
+```
+
+**Flags**:
+
+| Flag | Description |
+|---|---|
+| `-r <region>` | Region ID to verify (required). |
+
+**Example**:
+
+```bash
+tikv-ctl --host 127.0.0.1:20160 consistency-check -r 1
+```
+
+---
+
+### `show-cluster-id`
+
+Reads the cluster ID from the local data directory without connecting to PD. Requires both `--config` and `--data-dir`.
+
+**Syntax**:
+
+```bash
+tikv-ctl --config <cfg> show-cluster-id --data-dir <dir>
+```
+
+**Example**:
+
+```bash
+tikv-ctl --config /etc/tikv/tikv.toml show-cluster-id --data-dir /var/lib/tikv
+```
+
+---
+
+### `fork-readonly-tikv` (`reuse-readonly-remains`)
+
+Creates a read-only TiKV agent from an existing stopped TiKV data directory. The agent allows accessing all committed transactions without modifying the original data. Use this for recovery scenarios where you need to inspect or export data from a stopped node.
+
+<Note>
+  The original TiKV instance must not run concurrently with the agent. This command requires `raft-engine.enable-log-recycle = false` and `raft-engine.recovery-mode = tolerate-tail-corruption` in the config.
+</Note>
+
+**Syntax**:
+
+```bash
+tikv-ctl --config <cfg> reuse-readonly-remains \
+  --data-dir <original-dir> \
+  --agent-dir <agent-dir> \
+  [--snaps <symlink|copy>] \
+  [--rocksdb-files <symlink|copy>]
+```
+
+**Flags**:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--data-dir <dir>` | — | Data directory of the original (stopped) TiKV (required). |
+| `--agent-dir <dir>` | — | Directory where the agent will be created (required). |
+| `--snaps <method>` | `symlink` | How to reuse snapshot files: `symlink` or `copy`. |
+| `--rocksdb-files <method>` | `symlink` | How to reuse RocksDB files: `symlink` or `copy`. The last WAL file is always copied. |
+
+**Example**:
+
+```bash
+tikv-ctl --config /etc/tikv/tikv.toml \
+  reuse-readonly-remains \
+  --data-dir /var/lib/tikv \
+  --agent-dir /tmp/tikv-agent \
+  --snaps symlink \
+  --rocksdb-files copy
+```

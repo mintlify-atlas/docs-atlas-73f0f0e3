@@ -1,0 +1,106 @@
+---
+title: "tikv-ctl overview"
+description: "tikv-ctl is the command-line tool for inspecting and administering a TiKV cluster. Use it to query cluster state, manage regions, trigger compactions, recover data, and more."
+keywords: ["tikv-ctl", "cli", "administration", "rocksdb", "raft"]
+---
+
+`tikv-ctl` ships with TiKV and lets you interact with a running cluster over gRPC or directly with the underlying RocksDB data files on disk. Most day-to-day inspection tasks use remote mode; destructive recovery operations typically require local mode.
+
+## Operation modes
+
+`tikv-ctl` supports two mutually exclusive modes of operation.
+
+<AccordionGroup>
+  <Accordion title="Remote mode (--host)">
+    Remote mode connects to a live TiKV node over gRPC. You can run inspection and some management commands without stopping the server. Most commands that query cluster state—`store`, `cluster`, `raft region`, `metrics`, `consistency-check`, and so on—work in remote mode.
+
+    ```bash
+    tikv-ctl --host 127.0.0.1:20160 <subcommand>
+    ```
+
+    When TLS is enabled, supply the certificate triple alongside `--host`:
+
+    ```bash
+    tikv-ctl \
+      --host 127.0.0.1:20160 \
+      --ca-path /path/to/ca.crt \
+      --cert-path /path/to/client.crt \
+      --key-path /path/to/client.key \
+      <subcommand>
+    ```
+  </Accordion>
+
+  <Accordion title="Local mode (--data-dir)">
+    Local mode opens the RocksDB data files directly. It gives you access to raw on-disk state, which is necessary for recovery operations such as `tombstone`, `recover-mvcc`, `unsafe-recover`, and `bad-regions`.
+
+    <Warning>
+      Stop `tikv-server` before running any local-mode command that writes to the data directory. Running tikv-ctl against a live data directory can corrupt your data.
+    </Warning>
+
+    ```bash
+    tikv-ctl --data-dir /var/lib/tikv --config /etc/tikv/tikv.toml <subcommand>
+    ```
+
+    Both `--data-dir` and `--config` are required for local mode. `--config` tells tikv-ctl how the node was originally configured so it can open RocksDB with the matching options.
+  </Accordion>
+</AccordionGroup>
+
+## Global flags
+
+These flags apply to every invocation of `tikv-ctl`.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--host` | — | Address of a TiKV node for remote mode (e.g. `127.0.0.1:20160`). |
+| `--data-dir` | — | Path to the TiKV data directory for local mode. |
+| `--config` | — | Path to the TiKV config file (`tikv.toml`). Required with `--data-dir`. |
+| `--pd` | — | PD endpoint(s) for commands that contact PD (e.g. `127.0.0.1:2379`). |
+| `--ca-path` | — | CA certificate path for TLS. |
+| `--cert-path` | — | Client certificate path for TLS. |
+| `--key-path` | — | Client private key path for TLS. |
+| `--log-level` | `warn` | Log verbosity: `trace`, `debug`, `info`, `warn`, `error`. |
+| `--log-format` | `text` | Log output format: `text` or `json`. |
+| `--skip-paranoid-checks` | `false` | Skip RocksDB paranoid checks when opening the database. |
+
+### Key utility flags (no subcommand required)
+
+You can use these flags without a subcommand to convert key representations:
+
+| Flag | Description |
+|---|---|
+| `--to-escaped <hex>` | Convert a hex key to escaped form. |
+| `--to-hex <escaped>` | Convert an escaped key to hex form. |
+| `--decode <escaped>` | Decode an MVCC-encoded key in escaped format to a raw key. |
+| `--encode <escaped>` | Encode a raw key to MVCC-encoded escaped format. |
+
+## When to use remote vs local mode
+
+| Situation | Mode |
+|---|---|
+| Inspecting cluster state, region info, or Raft logs on a running node | Remote |
+| Printing Prometheus metrics or jemalloc stats | Remote |
+| Dynamically modifying TiKV config at runtime | Remote |
+| Injecting or recovering failpoints (testing only) | Remote |
+| Recovering corrupted MVCC data | Local |
+| Setting regions to tombstone after a store failure | Local |
+| Removing failed store peers (`unsafe-recover`) | Local |
+| Reading bad-region diagnostics | Local |
+| Compacting a specific key range on a single node | Either |
+
+## Prerequisites
+
+- **Remote mode**: a running TiKV node reachable from your machine, and (if TLS is enabled) a valid client certificate.
+- **Local mode**: direct filesystem access to the TiKV data directory. The `tikv-server` process must be stopped first.
+- The version of `tikv-ctl` should match the version of TiKV it connects to or whose data directory it opens.
+
+## Safety warnings
+
+<Warning>
+  Many `tikv-ctl` commands can cause data loss or cluster instability if used incorrectly. Before running any write or recovery command:
+
+  - Take a backup with BR or a filesystem snapshot.
+  - Confirm you are targeting the correct node and region IDs.
+  - Run with `--read-only` where the flag is available to verify what would change before committing.
+</Warning>
+
+Commands that are particularly dangerous include `tombstone`, `unsafe-recover remove-fail-stores`, `recover-mvcc`, `reset-to-version`, and `flashback`. Each of these pages calls out the specific risk.

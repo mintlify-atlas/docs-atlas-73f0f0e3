@@ -1,0 +1,329 @@
+---
+title: "Client drivers"
+description: "Official TiKV client libraries for Go, Java, Rust, C, and Python. Choose the client that matches your language and deployment requirements."
+keywords: ["client", "driver", "go", "java", "rust", "python", "grpc", "tikv client", "connection", "pd endpoints"]
+---
+
+## Available clients
+
+TiKV provides official client libraries for five languages. The Go client is the most stable and widely deployed; it is also the reference implementation for the client protocol.
+
+<CardGroup cols={2}>
+  <Card title="Go" icon="golang" href="https://github.com/tikv/client-go">
+    The most stable and widely used client. Supports Raw KV and Transactional KV. Used in production by TiDB.
+  </Card>
+  <Card title="Java" icon="java" href="https://github.com/tikv/client-java">
+    Full-featured Java client with Raw KV and Transactional KV support.
+  </Card>
+  <Card title="Rust" icon="rust" href="https://github.com/tikv/client-rust">
+    Async Rust client. Supports Raw KV and Transactional KV.
+  </Card>
+  <Card title="Python" icon="python" href="https://test.pypi.org/project/tikv-client/">
+    Python client available on test.pypi.org. Good for scripting, testing, and prototyping.
+  </Card>
+  <Card title="C" icon="c" href="https://github.com/tikv/client-c">
+    C client for embedding TiKV access in native and FFI-based applications.
+  </Card>
+</CardGroup>
+
+## API compatibility matrix
+
+| Client | Raw KV | Transactional KV |
+|---|---|---|
+| Go (`client-go`) | Yes | Yes |
+| Java (`client-java`) | Yes | Yes |
+| Rust (`client-rust`) | Yes | Yes |
+| Python (`tikv-client`) | Yes | Yes |
+| C (`client-c`) | Yes | Limited |
+
+## Installation
+
+<Tabs>
+  <Tab title="Go">
+
+```bash
+go get github.com/tikv/client-go/v2
+```
+
+  </Tab>
+  <Tab title="Java">
+
+Add the dependency to your `pom.xml`:
+
+```xml
+<dependency>
+  <groupId>org.tikv</groupId>
+  <artifactId>tikv-client-java</artifactId>
+  <version>3.3.0</version>
+</dependency>
+```
+
+Or in `build.gradle`:
+
+```groovy
+implementation 'org.tikv:tikv-client-java:3.3.0'
+```
+
+  </Tab>
+  <Tab title="Rust">
+
+Add the dependency to your `Cargo.toml`:
+
+```toml
+[dependencies]
+tikv-client = "0.3"
+```
+
+  </Tab>
+  <Tab title="Python">
+
+```bash
+pip install -i https://test.pypi.org/simple/ tikv-client
+```
+
+<Note>
+The Python client is published to test.pypi.org, not the main PyPI index. The `-i` flag is required.
+</Note>
+
+  </Tab>
+  <Tab title="C">
+
+Build from source:
+
+```bash
+git clone https://github.com/tikv/client-c.git
+cd client-c
+mkdir build && cd build
+cmake ..
+make
+```
+
+  </Tab>
+</Tabs>
+
+## Connecting to a cluster
+
+All clients connect through Placement Driver (PD) endpoints, not directly to TiKV nodes. PD handles region routing, leader election, and timestamp allocation. Pass all PD endpoints for your cluster so the client can tolerate individual PD node failures.
+
+<Tabs>
+  <Tab title="Go">
+
+```go
+import (
+    "github.com/tikv/client-go/v2/rawkv"
+    "github.com/tikv/client-go/v2/txnkv"
+)
+
+// Raw KV client
+rawClient, err := rawkv.NewClient(
+    context.Background(),
+    []string{"127.0.0.1:2379"},
+    config.DefaultConfig(),
+)
+if err != nil {
+    log.Fatal(err)
+}
+defer rawClient.Close()
+
+// Transactional KV client
+txnClient, err := txnkv.NewClient([]string{"127.0.0.1:2379"})
+if err != nil {
+    log.Fatal(err)
+}
+defer txnClient.Close()
+```
+
+  </Tab>
+  <Tab title="Java">
+
+```java
+import org.tikv.common.TiConfiguration;
+import org.tikv.common.TiSession;
+import org.tikv.raw.RawKVClient;
+
+TiConfiguration conf = TiConfiguration.createRawDefault("127.0.0.1:2379");
+TiSession session = TiSession.create(conf);
+RawKVClient client = session.createRawClient();
+```
+
+  </Tab>
+  <Tab title="Rust">
+
+```rust
+use tikv_client::{RawClient, TransactionClient};
+
+// Raw KV
+let raw = RawClient::new(vec!["127.0.0.1:2379"]).await?;
+
+// Transactional KV
+let txn = TransactionClient::new(vec!["127.0.0.1:2379"]).await?;
+```
+
+  </Tab>
+  <Tab title="Python">
+
+```python
+from tikv_client import RawClient, TransactionClient
+
+# Raw KV
+raw = RawClient.connect(["127.0.0.1:2379"])
+
+# Transactional KV
+txn = TransactionClient.connect(["127.0.0.1:2379"])
+```
+
+  </Tab>
+</Tabs>
+
+## Basic usage
+
+### Raw KV
+
+<Tabs>
+  <Tab title="Go">
+
+```go
+ctx := context.Background()
+
+// Put and get
+err = rawClient.Put(ctx, []byte("foo"), []byte("bar"), 0)
+val, err := rawClient.Get(ctx, []byte("foo"))
+fmt.Println(string(val)) // bar
+
+// Scan
+pairs, err := rawClient.Scan(ctx, []byte("user:"), []byte("user;"), 100)
+for _, pair := range pairs {
+    fmt.Println(string(pair.Key), string(pair.Value))
+}
+```
+
+  </Tab>
+  <Tab title="Java">
+
+```java
+import org.tikv.shade.com.google.protobuf.ByteString;
+
+ByteString key = ByteString.copyFromUtf8("foo");
+ByteString value = ByteString.copyFromUtf8("bar");
+
+client.put(key, value);
+ByteString result = client.get(key);
+System.out.println(result.toStringUtf8()); // bar
+```
+
+  </Tab>
+  <Tab title="Rust">
+
+```rust
+let client = RawClient::new(vec!["127.0.0.1:2379"]).await?;
+
+client.put("foo".to_owned(), "bar".to_owned()).await?;
+let val = client.get("foo".to_owned()).await?;
+println!("{:?}", val); // Some("bar")
+```
+
+  </Tab>
+  <Tab title="Python">
+
+```python
+from tikv_client import RawClient
+
+client = RawClient.connect(["127.0.0.1:2379"])
+
+client.put(b'foo', b'bar')
+print(client.get(b'foo'))  # b'bar'
+
+client.put(b'foo', b'baz')
+print(client.get(b'foo'))  # b'baz'
+```
+
+  </Tab>
+</Tabs>
+
+### Transactional KV
+
+<Tabs>
+  <Tab title="Go">
+
+```go
+txn, err := txnClient.Begin()
+if err != nil {
+    log.Fatal(err)
+}
+
+txn.Set([]byte("account:alice"), []byte("1000"))
+txn.Set([]byte("account:bob"), []byte("500"))
+
+if err := txn.Commit(context.Background()); err != nil {
+    txn.Rollback()
+    log.Fatal(err)
+}
+```
+
+  </Tab>
+  <Tab title="Java">
+
+```java
+import org.tikv.common.TiConfiguration;
+import org.tikv.common.TiSession;
+import org.tikv.txn.TxnKVClient;
+import org.tikv.shade.com.google.protobuf.ByteString;
+
+TiConfiguration conf = TiConfiguration.createDefault("127.0.0.1:2379");
+TiSession session = TiSession.create(conf);
+TxnKVClient client = session.createTxnClient();
+
+client.put(
+    ByteString.copyFromUtf8("account:alice"),
+    ByteString.copyFromUtf8("1000")
+);
+```
+
+  </Tab>
+  <Tab title="Rust">
+
+```rust
+use tikv_client::TransactionClient;
+
+let client = TransactionClient::new(vec!["127.0.0.1:2379"]).await?;
+let mut txn = client.begin_optimistic().await?;
+
+txn.put("account:alice".to_owned(), "1000".to_owned()).await?;
+txn.put("account:bob".to_owned(), "500".to_owned()).await?;
+
+txn.commit().await?;
+```
+
+  </Tab>
+  <Tab title="Python">
+
+```python
+from tikv_client import TransactionClient
+
+client = TransactionClient.connect(["127.0.0.1:2379"])
+
+txn = client.begin()
+txn.put(b'account:alice', b'1000')
+txn.put(b'account:bob', b'500')
+txn.commit()
+```
+
+  </Tab>
+</Tabs>
+
+## gRPC protocol
+
+All official clients communicate with TiKV over gRPC using protobuf-encoded messages. The service definitions are in the [`kvproto`](https://github.com/pingcap/kvproto) repository.
+
+Key service interfaces:
+
+| Service | Description |
+|---|---|
+| `TiKV` | Raw KV and Transactional KV operations |
+| `PD` | Timestamp allocation, region routing, cluster metadata |
+
+If you are building a custom client in a language not listed above, implement the `TiKV` gRPC service and use PD for timestamp allocation. Refer to the `kvproto` protobuf definitions for the full message schema.
+
+<Info>
+Clients connect to PD for cluster metadata and timestamps, then communicate directly with the TiKV nodes that own each region. This routing is handled transparently by all official client libraries.
+</Info>

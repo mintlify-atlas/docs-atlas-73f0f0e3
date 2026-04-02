@@ -1,0 +1,314 @@
+---
+title: "Raw KV API"
+description: "Direct key-value access without ACID transactions. Use Raw KV for simpler workloads that don't require multi-key atomicity or versioned reads."
+keywords: ["raw kv", "put", "get", "delete", "scan", "ttl", "column family", "tikv client"]
+---
+
+## Overview
+
+The Raw KV API gives you direct, low-latency access to TiKV's storage layer. Operations act on individual keys without any transaction coordination overhead. There are no commit timestamps, no 2-phase commit, and no conflict detection across operations.
+
+Use Raw KV when:
+
+- Your workload is cache-like: independent reads and writes to separate keys
+- You need the lowest possible latency and highest throughput
+- You do not need atomicity across multiple keys
+- You do not need to read your own writes within a larger logical operation
+
+<Warning>
+Do not mix Raw KV and Transactional KV operations on the same key space. The two APIs use different data encodings and MVCC layers. Mixing them corrupts data silently.
+</Warning>
+
+## Connecting a client
+
+The Python client (`tikv-client` on test.pypi.org) exposes `RawClient` for Raw KV access. Pass one or more PD endpoint addresses to `connect`.
+
+```python
+from tikv_client import RawClient
+
+client = RawClient.connect(["127.0.0.1:2379"])
+```
+
+For production clusters with multiple PD nodes, pass all PD addresses:
+
+```python
+client = RawClient.connect([
+    "10.0.0.1:2379",
+    "10.0.0.2:2379",
+    "10.0.0.3:2379",
+])
+```
+
+## Core operations
+
+### get
+
+Read a single value by key.
+
+<ParamField path="body.key" type="bytes" required>
+  The key to look up. Keys are arbitrary byte strings.
+</ParamField>
+
+<ParamField path="body.cf" type="string" default="default">
+  Column family to read from. One of `default`, `write`, or `lock`.
+</ParamField>
+
+**Returns:** The value as bytes, or `None` if the key does not exist.
+
+```python
+client.put(b'foo', b'bar')
+print(client.get(b'foo'))  # b'bar'
+
+print(client.get(b'missing'))  # None
+```
+
+---
+
+### put
+
+Write a single key-value pair.
+
+<ParamField path="body.key" type="bytes" required>
+  The key to write.
+</ParamField>
+
+<ParamField path="body.value" type="bytes" required>
+  The value to store. TiKV stores values as raw bytes; there is no schema enforcement.
+</ParamField>
+
+<ParamField path="body.ttl" type="number" default="0">
+  Time-to-live in seconds. `0` means the key never expires. Requires API version `V1Ttl` or `V2`.
+</ParamField>
+
+<ParamField path="body.cf" type="string" default="default">
+  Column family to write to.
+</ParamField>
+
+```python
+client.put(b'foo', b'bar')
+client.put(b'foo', b'baz')
+print(client.get(b'foo'))  # b'baz'
+```
+
+---
+
+### delete
+
+Remove a key. Deleting a key that does not exist is a no-op.
+
+<ParamField path="body.key" type="bytes" required>
+  The key to delete.
+</ParamField>
+
+<ParamField path="body.cf" type="string" default="default">
+  Column family to delete from.
+</ParamField>
+
+```python
+client.put(b'temp', b'value')
+client.delete(b'temp')
+print(client.get(b'temp'))  # None
+```
+
+---
+
+### batch_get
+
+Read multiple keys in a single RPC round-trip.
+
+<ParamField path="body.keys" type="bytes[]" required>
+  List of keys to look up. Order in the response matches the order of the request.
+</ParamField>
+
+<ParamField path="body.cf" type="string" default="default">
+  Column family to read from.
+</ParamField>
+
+**Returns:** A list of `(key, value)` pairs for keys that exist. Missing keys are omitted from the result.
+
+```python
+client.put(b'k1', b'v1')
+client.put(b'k2', b'v2')
+
+pairs = client.batch_get([b'k1', b'k2', b'k3'])
+# [(b'k1', b'v1'), (b'k2', b'v2')]
+```
+
+---
+
+### batch_put
+
+Write multiple key-value pairs in a single RPC round-trip.
+
+<ParamField path="body.pairs" type="object[]" required>
+  List of `{key, value}` pairs to write.
+</ParamField>
+
+<ParamField path="body.ttl" type="number" default="0">
+  TTL in seconds applied to all keys in the batch.
+</ParamField>
+
+```python
+client.batch_put({
+    b'key1': b'val1',
+    b'key2': b'val2',
+    b'key3': b'val3',
+})
+```
+
+---
+
+### batch_delete
+
+Delete multiple keys in a single RPC round-trip.
+
+<ParamField path="body.keys" type="bytes[]" required>
+  List of keys to delete.
+</ParamField>
+
+```python
+client.batch_delete([b'key1', b'key2', b'key3'])
+```
+
+---
+
+### scan
+
+Scan key-value pairs in a key range. The scan returns keys in ascending order by default.
+
+<ParamField path="body.start" type="bytes" required>
+  Start of the scan range (inclusive).
+</ParamField>
+
+<ParamField path="body.end" type="bytes">
+  End of the scan range (exclusive). Omit for an open-ended scan to the end of the keyspace.
+</ParamField>
+
+<ParamField path="body.limit" type="number" required>
+  Maximum number of key-value pairs to return. Set this to prevent unbounded scans.
+</ParamField>
+
+<ParamField path="body.key_only" type="boolean" default="false">
+  When `true`, return only keys without reading values. Useful for existence checks.
+</ParamField>
+
+<ParamField path="body.cf" type="string" default="default">
+  Column family to scan.
+</ParamField>
+
+**Returns:** A list of `(key, value)` pairs.
+
+```python
+client.batch_put({
+    b'user:1': b'alice',
+    b'user:2': b'bob',
+    b'user:3': b'carol',
+})
+
+results = client.scan(b'user:', b'user;', 10)
+# [(b'user:1', b'alice'), (b'user:2', b'bob'), (b'user:3', b'carol')]
+```
+
+<Tip>
+Use a key prefix as the start key and a prefix with the last byte incremented as the end key to scan all keys under a namespace. For example, `b'user:'` to `b'user;'` (`;` is one ASCII value above `:`).
+</Tip>
+
+---
+
+### delete_range
+
+Delete all keys in a key range.
+
+<ParamField path="body.start" type="bytes" required>
+  Start of the range to delete (inclusive).
+</ParamField>
+
+<ParamField path="body.end" type="bytes" required>
+  End of the range to delete (exclusive).
+</ParamField>
+
+<ParamField path="body.cf" type="string" default="default">
+  Column family to delete from.
+</ParamField>
+
+```python
+# Delete all user keys
+client.delete_range(b'user:', b'user;')
+```
+
+<Warning>
+`delete_range` is not atomic. If the operation is interrupted, some keys in the range may already be deleted. Retry from a clean state.
+</Warning>
+
+## TTL support
+
+Raw KV supports per-key expiry when the cluster is configured with API version `V1Ttl` or `V2`. Set `ttl` to the desired lifetime in seconds. A value of `0` means the key never expires.
+
+TiKV records the expiry timestamp at write time using the cluster's causal timestamp provider. Reads on expired keys return `None` automatically.
+
+```python
+# Key expires after 60 seconds
+client.put(b'session:abc', b'data', ttl=60)
+```
+
+<Info>
+TTL is enforced lazily. Expired keys are not immediately removed from storage; they are cleaned up during compaction.
+</Info>
+
+## Checksum / CRC
+
+The `raw_checksum_ranges` operation computes a CRC-64 (XOR) checksum over a list of key ranges. The checksum covers the user-visible key and value bytes — not the internal MVCC encoding — so it is stable across API versions.
+
+The operation returns:
+- `checksum` — a `uint64` CRC-64 XOR digest
+- `total_kvs` — count of key-value pairs scanned
+- `total_bytes` — total byte size of keys and values scanned
+
+Use this to verify consistency between a backup and a live cluster.
+
+## Column families
+
+TiKV stores data in three column families (CFs):
+
+| CF | Purpose |
+|---|---|
+| `default` | User data for Raw KV and Transactional KV values |
+| `write` | MVCC write records (commit timestamps, value pointers) |
+| `lock` | In-progress transaction lock records |
+
+Raw KV operations default to the `default` CF. You should not write to `write` or `lock` directly; those CFs are managed by the transaction layer.
+
+## Key constraints
+
+- Keys are arbitrary byte strings.
+- Keys must not be empty.
+- The recommended maximum key size is **4 KB**, though TiKV does not enforce a hard limit. Very large keys hurt scan and compaction performance.
+- The maximum value size is **10 MB** by default (configurable via `raft-entry-max-size`).
+
+## API versioning
+
+The Raw KV store is backed by a versioned API layer (`ApiV1`, `ApiV1Ttl`, `ApiV2`). The API version is set at the cluster level, not per-request.
+
+| Version | TTL support | MVCC isolation from TxnKV |
+|---|---|---|
+| `V1` | No | No |
+| `V1Ttl` | Yes | No |
+| `V2` | Yes | Yes (separate keyspace) |
+
+Use `V2` if you need to run both Raw KV and Transactional KV workloads on the same cluster without risking key collisions.
+
+## Error handling
+
+Common errors you may encounter:
+
+| Error | Cause | Recovery |
+|---|---|---|
+| `RegionNotFound` | The target region has moved or is not yet available | Retry; the client will refresh region routing automatically |
+| `ServerIsBusy` | TiKV is under load | Back off and retry with exponential backoff |
+| `KeyIsLocked` | A transaction holds a lock on the key | This should not occur with Raw KV unless data was written by TxnKV |
+| `RawKvMaxTimestampNotSynced` | The cluster's max timestamp has not replicated to this region | Retry after a short delay |
+| `InvalidReqRange` | Start key is after end key, or the range falls outside the region bounds | Validate key range before issuing the request |
+
+<Note>
+Official client libraries handle region routing, retries, and leader elections transparently. You only need to handle application-level errors such as `KeyNotFound`.
+</Note>

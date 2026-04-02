@@ -1,0 +1,219 @@
+---
+title: "Coprocessor"
+description: "How TiKV's coprocessor pushes computation — table scans, aggregations, and custom logic — down to the storage layer."
+keywords: ["coprocessor", "pushdown", "dag", "tidb", "sql", "plugin", "coprocessor v2"]
+---
+
+The TiKV coprocessor lets callers execute computation directly on storage nodes, close to the data. Instead of transferring raw key-value pairs to a client and computing there, the coprocessor filters, aggregates, and transforms data inside TiKV, then sends back only the result. This dramatically reduces network traffic and moves CPU-intensive work to where storage I/O already happens.
+
+<Note>
+Most TiDB read queries are processed by the coprocessor rather than the raw KV interface. The coprocessor is the primary path for SQL query execution in the TiKV + TiDB stack.
+</Note>
+
+## Why the coprocessor matters
+
+Without a coprocessor, a query like `SELECT count(*) FROM orders WHERE status = 'shipped'` would require the database layer to scan every row from TiKV, transfer it over the network, and evaluate the filter. With the coprocessor:
+
+1. TiDB compiles the query into a DAG (directed acyclic graph) of executors.
+2. TiDB sends the DAG request to each relevant TiKV node.
+3. TiKV executes the scan, filter, and partial aggregation locally.
+4. TiDB receives and merges the partial results.
+
+The coprocessor module is described in the source as handling "simple SQL query executors locally" — but it also handles statistics analysis requests (`ANALYZE TABLE`) and checksum requests (`ADMIN CHECKSUM TABLE`):
+
+```rust
+// src/coprocessor/mod.rs
+pub const REQ_TYPE_DAG: i64 = 103;      // SQL pushdown
+pub const REQ_TYPE_ANALYZE: i64 = 104;  // table/index statistics
+pub const REQ_TYPE_CHECKSUM: i64 = 105; // data integrity check
+```
+
+## Request handling
+
+The entry point for all coprocessor requests is `Endpoint`:
+
+```rust
+// src/coprocessor/endpoint.rs
+pub struct Endpoint<E: Engine> {
+    read_pool: ReadPoolHandle,         // thread pool for coprocessor tasks
+    semaphore: Option<Arc<Semaphore>>, // concurrency limiter
+    memory_quota: Arc<MemoryQuota>,    // per-request memory cap
+    concurrency_manager: ConcurrencyManager,
+    batch_row_limit: usize,
+    stream_batch_row_limit: usize,
+    max_handle_duration: Duration,
+    // ...
+}
+```
+
+When a coprocessor request arrives, `Endpoint` follows these steps:
+
+<Steps>
+  <Step title="Parse the request">
+    The raw protobuf bytes are decoded into a `DagRequest`, `AnalyzeReq`, or `ChecksumRequest`. The request includes key ranges, a transaction start timestamp, and executor descriptors.
+  </Step>
+  <Step title="Acquire a snapshot">
+    TiKV reads a consistent snapshot at the request's `txn_start_ts` from the underlying storage engine.
+  </Step>
+  <Step title="Build the handler">
+    A `RequestHandler` is constructed from the snapshot and the request. For DAG requests, this is a `BatchDagHandler` that wraps a chain of batch executors.
+  </Step>
+  <Step title="Execute on the read pool">
+    The handler runs on a dedicated coprocessor thread pool, separate from Raft I/O threads. Light tasks (expected to finish in under 5 ms) skip the semaphore and run immediately.
+  </Step>
+  <Step title="Return the response">
+    For unary requests, the handler produces a single response. For streaming requests, it produces a sequence of responses via `handle_streaming_request`.
+  </Step>
+</Steps>
+
+```rust
+// src/coprocessor/mod.rs
+#[async_trait]
+pub trait RequestHandler: Send {
+    async fn handle_request(&mut self) -> Result<MemoryTraceGuard<coppb::Response>>;
+    async fn handle_streaming_request(&mut self) -> HandlerStreamStepResult;
+    fn collect_scan_statistics(&mut self, _dest: &mut Statistics) {}
+    fn collect_scan_summary(&mut self, _dest: &mut ExecSummary) {}
+}
+```
+
+## Coprocessor V1: DAG request types
+
+The primary coprocessor (V1) processes DAG requests composed of a pipeline of **executors**. TiDB constructs the DAG and TiKV evaluates it bottom-up. Common executor types pushed down include:
+
+<CardGroup cols={2}>
+  <Card title="TableScan / IndexScan" icon="table">
+    Scans a key range in a Region, reading rows or index entries from RocksDB column families.
+  </Card>
+  <Card title="Selection" icon="filter">
+    Evaluates filter expressions (e.g., `WHERE status = 'shipped'`) against scanned rows and discards non-matching ones.
+  </Card>
+  <Card title="Aggregation" icon="sigma">
+    Computes partial aggregates (SUM, COUNT, MAX, MIN, AVG) over the rows that pass the selection. TiDB merges partials from multiple Regions.
+  </Card>
+  <Card title="Limit / TopN" icon="arrow-down-01">
+    Returns only the first N rows, or the top-N rows by a sort key, stopping the scan early when possible.
+  </Card>
+</CardGroup>
+
+The `DagHandlerBuilder` constructs a `BatchDagHandler` that drives the executor pipeline:
+
+```rust
+// src/coprocessor/dag/mod.rs
+impl BatchDagHandler {
+    pub fn new<S: Store + 'static, F: KvFormat>(
+        req: DagRequest,
+        ranges: Vec<KeyRange>,
+        store: S,
+        // ...
+    ) -> Result<Self> {
+        Ok(Self {
+            runner: tidb_query_executors::runner::BatchExecutorsRunner::from_request::<_, F>(
+                req, ranges, TikvStorage::new(store, is_cache_enabled), /* ... */
+            )?,
+            data_version,
+        })
+    }
+}
+```
+
+Each request carries a `ReqContext` with the scan key ranges, transaction timestamp, bypass/access lock sets, and a deadline:
+
+```rust
+// src/coprocessor/mod.rs
+pub struct ReqContextInner {
+    pub context: kvrpcpb::Context,
+    pub ranges: Vec<coppb::KeyRange>,
+    pub deadline: Deadline,
+    pub txn_start_ts: TimeStamp,
+    pub bypass_locks: TsSet,   // locks to skip (will be rolled back)
+    pub access_locks: TsSet,   // locks whose values are readable
+    pub cache_match_version: Option<u64>,
+    pub perf_level: PerfLevel,
+    // ...
+}
+```
+
+## Coprocessor V2: plugin system
+
+Coprocessor V2 (in `src/coprocessor_v2`) provides a plugin architecture that lets you load arbitrary computation into TiKV at runtime as **shared libraries**. The design follows the model of HBase's coprocessor framework.
+
+<Info>
+The long-term goal of Coprocessor V2 is to replace the fixed executor set of V1 with equivalent plugins, while also allowing entirely custom handlers.
+</Info>
+
+### Plugin API
+
+Plugins are compiled against the `coprocessor_plugin_api` crate, which defines the interface a plugin must implement. The registry loads plugins from `.so` / `.dylib` files at startup or via hot-reload.
+
+The plugin registry verifies compatibility before loading:
+
+```rust
+// src/coprocessor_v2/plugin_registry.rs
+fn err_on_mismatch(
+    plugin_build_info: &BuildInfo,
+    tikv_build_info: &BuildInfo,
+) -> Result<(), PluginLoadingError> {
+    if plugin_build_info.api_version != tikv_build_info.api_version {
+        Err(PluginLoadingError::ApiMismatch { .. })
+    } else if plugin_build_info.rustc != tikv_build_info.rustc {
+        Err(PluginLoadingError::CompilerMismatch { .. })
+    } else if plugin_build_info.target != tikv_build_info.target {
+        Err(PluginLoadingError::TargetMismatch { .. })
+    } else {
+        Ok(())
+    }
+}
+```
+
+Three compatibility checks are enforced before a plugin can be registered:
+
+- **API version**: the plugin must be compiled against the same `coprocessor_plugin_api` version as TiKV.
+- **Rust compiler**: the plugin and TiKV must be compiled with the same `rustc` version to ensure ABI compatibility.
+- **Target triple**: the plugin must match TiKV's compilation target (e.g., `x86_64-unknown-linux-gnu`).
+
+### Writing a plugin
+
+To write a Coprocessor V2 plugin, add `coprocessor_plugin_api` as a dependency and implement the required trait. The plugin receives a raw key-value request and a `RawStorage` handle it can use to read data from TiKV:
+
+```toml
+# Cargo.toml for a coprocessor plugin
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+coprocessor_plugin_api = { path = "path/to/tikv/components/coprocessor_plugin_api" }
+```
+
+<Warning>
+Because plugins are loaded as native shared libraries, a crash in a plugin can bring down the TiKV process. Test plugins thoroughly before deploying to production.
+</Warning>
+
+## Coprocessor thread pool configuration
+
+The coprocessor runs on a unified read pool that is also used for KV read requests. You can tune the pool size and behavior:
+
+```toml
+[readpool.coprocessor]
+use-unified-pool = true
+
+[readpool.unified]
+min-thread-count = 1
+max-thread-count = 8        # default: 0.8 × logical CPUs, rounded up
+stack-size = "10MB"
+max-tasks-per-worker = 2000 # backpressure limit
+```
+
+<AccordionGroup>
+  <Accordion title="Key coprocessor configuration reference">
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `readpool.unified.max-thread-count` | `ceil(0.8 × CPUs)` | Maximum threads in the unified read pool |
+| `readpool.unified.max-tasks-per-worker` | `2000` | Queue depth per thread before backpressure |
+| `server.end-point-recursion-limit` | `1000` | Protobuf recursion limit for coprocessor requests |
+| `server.end-point-request-max-handle-duration` | `60s` | Maximum time a coprocessor request may run |
+| `server.end-point-max-concurrency` | `0` (no limit) | Maximum concurrent coprocessor requests |
+
+  </Accordion>
+</AccordionGroup>

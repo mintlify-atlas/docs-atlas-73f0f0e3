@@ -1,0 +1,257 @@
+---
+title: "Configuration overview"
+description: "How to configure TiKV using TOML config files, command-line flags, and online config changes."
+---
+
+TiKV reads its configuration from a TOML file at startup. You can also override individual settings using command-line flags, and change a subset of options at runtime without restarting the server.
+
+## Config file
+
+The primary way to configure TiKV is through a TOML config file. Pass the file path to `tikv-server` using the `--config` flag:
+
+```bash
+tikv-server --config /etc/tikv/tikv.toml
+```
+
+If no config file is specified, TiKV uses built-in defaults for every option.
+
+TiKV writes the effective configuration to `last_tikv.toml` in its data directory after each startup. You can inspect this file to see exactly which values took effect.
+
+### Minimal working configuration
+
+The following example is the minimum you need to connect a TiKV node to a PD cluster:
+
+```toml
+[server]
+addr = "0.0.0.0:20160"
+advertise-addr = "192.168.1.10:20160"
+status-addr = "192.168.1.10:20180"
+
+[pd]
+endpoints = ["192.168.1.1:2379", "192.168.1.2:2379", "192.168.1.3:2379"]
+
+[storage]
+data-dir = "/data/tikv"
+
+[log]
+level = "info"
+```
+
+<Note>
+  `advertise-addr` must be a reachable address for other TiKV nodes and TiDB instances. It cannot be `0.0.0.0`.
+</Note>
+
+## Command-line flags
+
+You can override any config file option on the command line. Flags use the same names as config keys, prefixed with `--`. Nested keys use `.` as separator:
+
+```bash
+tikv-server \
+  --config /etc/tikv/tikv.toml \
+  --server.addr "0.0.0.0:20160" \
+  --pd.endpoints "pd1:2379,pd2:2379,pd3:2379" \
+  --storage.data-dir "/data/tikv"
+```
+
+Command-line flags take precedence over config file values.
+
+## Online config changes
+
+Some settings can be changed at runtime without restarting TiKV. You can apply online changes using `tikv-ctl` or the PD control API. TiKV marks online-configurable fields with the `OnlineConfig` trait in the source code.
+
+<Warning>
+  Settings not marked as online-configurable require a full restart to take effect. Verify a setting is online-configurable before attempting to change it at runtime.
+</Warning>
+
+Examples of settings that support online changes:
+
+- `server.grpc-memory-pool-quota`
+- `storage.scheduler-worker-pool-size`
+- `storage.flow-control.enable`
+- `storage.block-cache.capacity`
+- `raftstore.raft-log-gc-threshold`
+- `rocksdb.defaultcf.write-buffer-size`
+
+## Configuration sections
+
+TiKV's configuration is divided into the following top-level sections:
+
+<AccordionGroup>
+  <Accordion title="[server]">
+    Controls the gRPC server, listening addresses, snapshot transfer limits, and coprocessor settings.
+
+    Key options:
+    - `addr` — Listening address for client and peer traffic (default: `127.0.0.1:20160`)
+    - `advertise-addr` — Address advertised to other nodes; falls back to `addr` if unset
+    - `status-addr` — HTTP address for Prometheus metrics and status queries (default: `127.0.0.1:20180`)
+    - `grpc-concurrency` — Number of gRPC worker threads
+    - `concurrent-send-snap-limit` / `concurrent-recv-snap-limit` — Snapshot concurrency limits
+    - `labels` — Key-value labels for topology-aware scheduling (e.g., `zone`, `rack`)
+
+    ```toml
+    [server]
+    addr = "0.0.0.0:20160"
+    advertise-addr = "192.168.1.10:20160"
+    status-addr = "0.0.0.0:20180"
+    grpc-concurrency = 5
+    labels = { zone = "us-west-1", disk = "ssd" }
+    ```
+  </Accordion>
+
+  <Accordion title="[storage]">
+    Controls where TiKV stores data, how much space it uses, and the write scheduler.
+
+    Key options:
+    - `data-dir` — Root directory for RocksDB data files (default: `./`)
+    - `engine` — Storage engine type: `raft-kv` (default) or `partitioned-raft-kv`
+    - `reserve-space` — Disk space reserved to allow recovery from a full disk (default: `5GB`)
+    - `scheduler-worker-pool-size` — Number of write worker threads
+
+    See [Storage configuration](/configuration/storage) for full details.
+
+    ```toml
+    [storage]
+    data-dir = "/data/tikv"
+    reserve-space = "5GB"
+    scheduler-worker-pool-size = 4
+    ```
+  </Accordion>
+
+  <Accordion title="[raftstore]">
+    Controls Raft consensus behavior: election timeouts, heartbeats, region splits, log GC, and hibernation.
+
+    Key options:
+    - `raft-base-tick-interval` — Base tick duration driving all Raft timers
+    - `raft-election-timeout-ticks` — Ticks before a follower starts an election
+    - `region-max-size` / `region-split-size` — Size thresholds that trigger region splitting
+    - `hibernate-regions` — Pause idle regions to reduce CPU usage
+
+    See [Raftstore configuration](/configuration/raftstore) for full details.
+
+    ```toml
+    [raftstore]
+    raft-base-tick-interval = "1s"
+    region-max-size = "384MB"
+    region-split-size = "256MB"
+    hibernate-regions = true
+    ```
+  </Accordion>
+
+  <Accordion title="[rocksdb]">
+    Controls RocksDB engine behavior: background jobs, file limits, WAL settings, and column family options.
+
+    Key options:
+    - `max-background-jobs` — Total background compaction and flush threads (default: `8` or `CPU_NUM - 1`)
+    - `max-open-files` — Maximum open file descriptors (default: `40960`)
+    - `bytes-per-sync` — Incremental sync size for background writes (default: `1MB`)
+    - `[rocksdb.defaultcf]`, `[rocksdb.writecf]`, `[rocksdb.lockcf]` — Per-column-family options
+
+    See [Storage configuration](/configuration/storage) for RocksDB and block cache details.
+
+    ```toml
+    [rocksdb]
+    max-background-jobs = 8
+    max-open-files = 40960
+    bytes-per-sync = "1MB"
+    ```
+  </Accordion>
+
+  <Accordion title="[coprocessor]">
+    Controls region split behavior and coprocessor plugin loading.
+
+    Key options:
+    - `region-max-size` — Region size limit before a split is triggered (default: `384MB`)
+    - `region-split-size` — Target size after a split (default: `256MB`)
+    - `split-region-on-table` — Split regions at TiDB table boundaries (useful for clusters with few, large tables)
+    - `batch-split-limit` — Maximum split keys produced in one split check batch (default: `10`)
+
+    ```toml
+    [coprocessor]
+    region-max-size = "384MB"
+    region-split-size = "256MB"
+    split-region-on-table = false
+    ```
+  </Accordion>
+
+  <Accordion title="[security]">
+    Controls TLS certificates for peer and client connections, and encryption at rest.
+
+    Key options:
+    - `ca-path`, `cert-path`, `key-path` — Paths to TLS certificate files
+    - `[security.encryption]` — Encryption-at-rest method and master key settings
+
+    See [Security configuration](/configuration/security) for full details.
+
+    ```toml
+    [security]
+    ca-path = "/etc/tikv/ca.pem"
+    cert-path = "/etc/tikv/server.pem"
+    key-path = "/etc/tikv/server-key.pem"
+    ```
+  </Accordion>
+
+  <Accordion title="[pd]">
+    Controls how TiKV connects to Placement Driver (PD).
+
+    Key options:
+    - `endpoints` — List of PD node addresses (required)
+    - `retry-interval` — Delay between reconnection attempts (default: `300ms`)
+    - `retry-max-count` — Maximum reconnection attempts; `-1` means unlimited
+
+    ```toml
+    [pd]
+    endpoints = ["pd1:2379", "pd2:2379", "pd3:2379"]
+    retry-interval = "300ms"
+    retry-max-count = -1
+    ```
+  </Accordion>
+
+  <Accordion title="[log]">
+    Controls log level, format, and file rotation.
+
+    Key options:
+    - `level` — Log level: `debug`, `info`, `warn`, `error`, `fatal` (default: `info`)
+    - `format` — Log format: `text` or `json` (default: `text`)
+    - `[log.file].filename` — Log file path; if unset, logs go to stderr
+    - `[log.file].max-size` — Maximum log file size in MB before rotation (default: `300`)
+    - `[log.file].max-days` — Number of days to retain old log files (default: `0`, keep all)
+    - `[log.file].max-backups` — Number of old log files to retain (default: `0`, keep all)
+
+    ```toml
+    [log]
+    level = "info"
+    format = "text"
+
+    [log.file]
+    filename = "/var/log/tikv/tikv.log"
+    max-size = 300
+    max-days = 30
+    max-backups = 10
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Human-readable size and duration values
+
+Throughout the config file, sizes and durations accept human-readable strings:
+
+| Unit type | Examples |
+|-----------|---------|
+| File size (binary) | `"1KB"`, `"128MB"`, `"5GB"`, `"1TB"` |
+| Duration | `"100ms"`, `"10s"`, `"5m"`, `"1h"` |
+
+Raw integers are also accepted and are interpreted in the base unit (bytes for sizes, milliseconds for durations).
+
+## Configuration reference pages
+
+<CardGroup cols={2}>
+  <Card title="Storage configuration" icon="database" href="/configuration/storage">
+    Data directory, RocksDB, block cache, Titan, and column families.
+  </Card>
+  <Card title="Raftstore configuration" icon="server" href="/configuration/raftstore">
+    Raft consensus, region splits, log GC, and heartbeats.
+  </Card>
+  <Card title="Security configuration" icon="lock" href="/configuration/security">
+    TLS, encryption at rest, and KMS master key.
+  </Card>
+</CardGroup>

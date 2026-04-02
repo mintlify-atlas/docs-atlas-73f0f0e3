@@ -1,0 +1,143 @@
+---
+title: 'Deploy with binary'
+description: 'Download and run TiKV and PD binaries to deploy a cluster without Docker or TiUP.'
+---
+
+You can run TiKV directly from pre-built binaries. This is the quickest way to get a single-node or multi-node cluster running on Linux or macOS without installing additional tooling.
+
+## Prerequisites
+
+- Linux (`amd64` or `arm64`) or macOS (`amd64` or `arm64`)
+- `curl` and `tar` available on your `PATH`
+- Python 3.5 or later (to verify the deployment with the Python client)
+
+## Deploy a single-node cluster
+
+<Steps>
+  <Step title="Set version and platform variables">
+    Choose the TiKV version and your target platform. Only `darwin` and `linux` are supported for `GOOS`, and only `amd64` and `arm64` for `GOARCH`.
+
+    ```bash
+    export TIKV_VERSION=v7.5.0
+    export GOOS=linux    # darwin or linux
+    export GOARCH=amd64  # amd64 or arm64
+    ```
+  </Step>
+
+  <Step title="Download and extract binaries">
+    Download both the TiKV and PD (Placement Driver) binaries from the PingCAP mirror, then extract them.
+
+    ```bash
+    curl -O https://tiup-mirrors.pingcap.com/tikv-$TIKV_VERSION-$GOOS-$GOARCH.tar.gz
+    curl -O https://tiup-mirrors.pingcap.com/pd-$TIKV_VERSION-$GOOS-$GOARCH.tar.gz
+    tar -xzf tikv-$TIKV_VERSION-$GOOS-$GOARCH.tar.gz
+    tar -xzf pd-$TIKV_VERSION-$GOOS-$GOARCH.tar.gz
+    ```
+
+    After extraction you will have `pd-server` and `tikv-server` executables in your current directory.
+  </Step>
+
+  <Step title="Start PD">
+    PD manages cluster metadata, schedules Regions, and exposes the client API that TiKV nodes register with.
+
+    ```bash
+    ./pd-server \
+      --name=pd \
+      --data-dir=/tmp/pd/data \
+      --client-urls="http://127.0.0.1:2379" \
+      --peer-urls="http://127.0.0.1:2380" \
+      --initial-cluster="pd=http://127.0.0.1:2380" \
+      --log-file=/tmp/pd/log/pd.log
+    ```
+
+    | Flag | Purpose |
+    |---|---|
+    | `--name` | Human-readable name for this PD member |
+    | `--data-dir` | Directory where PD stores its state |
+    | `--client-urls` | Address that clients (including TiKV) connect to |
+    | `--peer-urls` | Address used for Raft peer communication between PD nodes |
+    | `--initial-cluster` | Comma-separated bootstrap list of `name=peer-url` pairs |
+    | `--log-file` | Path for PD log output |
+
+    PD listens on port `2379` for client requests and `2380` for peer traffic.
+  </Step>
+
+  <Step title="Start TiKV">
+    In a new terminal, start the TiKV node and point it at the running PD instance.
+
+    ```bash
+    ./tikv-server \
+      --pd-endpoints="127.0.0.1:2379" \
+      --addr="127.0.0.1:20160" \
+      --data-dir=/tmp/tikv/data \
+      --log-file=/tmp/tikv/log/tikv.log
+    ```
+
+    | Flag | Purpose |
+    |---|---|
+    | `--pd-endpoints` | Comma-separated list of PD client URLs |
+    | `--addr` | Address TiKV listens on for client and peer traffic |
+    | `--data-dir` | Directory where TiKV stores RocksDB data |
+    | `--log-file` | Path for TiKV log output |
+  </Step>
+
+  <Step title="Verify the deployment">
+    Install the Python client and confirm that reads and writes work.
+
+    ```bash
+    pip3 install -i https://test.pypi.org/simple/ tikv-client
+    ```
+
+    ```python
+    from tikv_client import RawClient
+
+    client = RawClient.connect(["127.0.0.1:2379"])
+
+    client.put(b'foo', b'bar')
+    print(client.get(b'foo'))  # b'bar'
+
+    client.put(b'foo', b'baz')
+    print(client.get(b'foo'))  # b'baz'
+    ```
+  </Step>
+</Steps>
+
+## Add more TiKV nodes
+
+TiKV is designed to scale horizontally. To grow your cluster, start additional `tikv-server` processes — on the same machine or on separate hosts — and point each one at the same PD endpoints. Each node must use a unique `--addr` and a separate `--data-dir`.
+
+```bash
+# Node 2 (run on a different host or a different port on the same host)
+./tikv-server \
+  --pd-endpoints="127.0.0.1:2379" \
+  --addr="127.0.0.1:20161" \
+  --data-dir=/tmp/tikv2/data \
+  --log-file=/tmp/tikv2/log/tikv.log
+
+# Node 3
+./tikv-server \
+  --pd-endpoints="127.0.0.1:2379" \
+  --addr="127.0.0.1:20162" \
+  --data-dir=/tmp/tikv3/data \
+  --log-file=/tmp/tikv3/log/tikv.log
+```
+
+PD automatically detects new nodes, assigns Regions to them, and rebalances data. No cluster restart is required.
+
+<Tip>
+For a fault-tolerant cluster you need at least three TiKV nodes (to satisfy the default Raft replication factor of 3) and three PD nodes. See the [TiUP deployment guide](/deploy/tiup) for a production-ready setup with multiple PD nodes.
+</Tip>
+
+## Check cluster status
+
+You can query PD's health endpoint at any time to confirm all members are healthy:
+
+```bash
+curl http://127.0.0.1:2379/pd/api/v1/health
+```
+
+A healthy single-PD response looks like:
+
+```json
+[{"name":"pd","member_id":14855926643635649475,"client_urls":["http://127.0.0.1:2379"],"health":true}]
+```

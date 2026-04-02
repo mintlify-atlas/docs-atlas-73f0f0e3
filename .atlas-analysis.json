@@ -1,28 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "TiKV",
+  "projectType": "infrastructure",
+  "projectName": "TiKV",
+  "projectDescription": "An open-source, distributed, and transactional key-value database powered by Rust and Raft, designed for horizontal scalability and ACID-compliant transactions.",
   "theme": "aspen",
-  "colors": {
-    "primary": "#bbbbbb",
-    "light": "#e60c34",
-    "dark": "#142c73"
-  },
-  "favicon": "https://media.brand.dev/6e6d7ee4-ef59-4670-8dc9-5a32ee78bbea.jpg",
-  "logo": {
-    "light": "https://media.brand.dev/99fc0ac6-93ed-4b8a-9221-2d6546cef414.png",
-    "dark": "https://media.brand.dev/99fc0ac6-93ed-4b8a-9221-2d6546cef414.png"
-  },
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/tikv/tikv"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/tikv/tikv"
-    }
-  },
+  "primaryColor": "#bbbbbb",
+  "lightColor": "#e60c34",
+  "darkColor": "#142c73",
   "navigation": {
     "tabs": [
       {
@@ -103,5 +86,28 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "Distributed key-value storage with Raft consensus for strong consistency",
+    "ACID-compliant distributed transactions using Percolator model",
+    "Horizontal scalability to 100+ TBs via Placement Driver (PD) auto-sharding",
+    "Multi-Version Concurrency Control (MVCC) for snapshot isolation",
+    "Geo-replication across data centers",
+    "Coprocessor framework for distributed computing push-down",
+    "TLS encryption and role-based access control",
+    "Backup/restore with point-in-time recovery (PITR)",
+    "Change Data Capture (CDC) for real-time data streaming",
+    "RocksDB-backed storage engine with Titan for large values"
+  ],
+  "publicApiSurface": [
+    "RawClient.get / RawClient.put / RawClient.delete / RawClient.scan",
+    "TransactionClient.begin / Transaction.get / Transaction.put / Transaction.commit",
+    "gRPC KvGet / KvScan / KvPrewrite / KvCommit / KvRollback",
+    "gRPC RawGet / RawPut / RawDelete / RawScan / RawBatchGet",
+    "tikv-ctl raft / tikv-ctl store / tikv-ctl region / tikv-ctl compact",
+    "tikv-ctl unsafe-recover / tikv-ctl snapshot / tikv-ctl tombstone",
+    "HTTP Status API: /status / /metrics / /config / /region-meta",
+    "Coprocessor plugin API (coprocessor_plugin_api)",
+    "PD client API for cluster management and scheduling"
+  ]
 }

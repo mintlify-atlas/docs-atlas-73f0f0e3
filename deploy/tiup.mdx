@@ -1,0 +1,119 @@
+---
+title: 'Deploy with TiUP'
+description: 'Use TiUP, the official TiDB ecosystem component manager, to spin up a local playground or deploy a production TiKV cluster.'
+---
+
+TiUP is the official component manager for the TiDB ecosystem. It handles downloading, versioning, and lifecycle management for TiKV, PD, and related tools. You can use it for a single-command local playground or for a fully automated production cluster deployment over SSH.
+
+## Install TiUP
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://tiup-mirrors.pingcap.com/install.sh | sh
+```
+
+After installation, add TiUP to your shell's `PATH` by following the instructions printed to the terminal, or by running:
+
+```bash
+source ~/.bashrc   # or ~/.zshrc, depending on your shell
+```
+
+## Quick playground
+
+The fastest way to try TiKV is `tiup playground`. It starts a local cluster with TiKV and PD running as background processes, with no topology file or SSH configuration required.
+
+```bash
+tiup playground
+```
+
+You can also pin a specific version:
+
+```bash
+tiup playground v7.5.0
+```
+
+`tiup playground` prints the PD client URL once the cluster is ready. Use that address to connect any TiKV client.
+
+<Note>
+`tiup playground` is intended for local development and experimentation. It is not suitable for production use.
+</Note>
+
+## Production cluster deployment
+
+For production, use `tiup cluster`. It deploys TiKV, PD, and optional monitoring components (Prometheus, Grafana, Alertmanager) to remote hosts over SSH.
+
+<Steps>
+  <Step title="Ensure SSH access">
+    The machine where you run TiUP must be able to reach all target nodes over SSH without a password prompt. Set up SSH key authentication before proceeding.
+  </Step>
+
+  <Step title="Write a topology file">
+    Create a `topo.yaml` file that describes your cluster layout. The example below deploys three PD nodes, three TiKV nodes, and optional monitoring services.
+
+    ```yaml
+    global:
+      user: "ubuntu"
+      ssh_port: 22
+      deploy_dir: "whatever"
+      data_dir: "whatever"
+
+    pd_servers:
+      - host: x.x.x.x
+      - host: y.y.y.y
+      - host: z.z.z.z
+
+    tikv_servers:
+      - host: x.x.x.x
+      - host: y.y.y.y
+      - host: z.z.z.z
+
+    monitoring_servers:
+      - host: a.a.a.a
+
+    grafana_servers:
+      - host: b.b.b.b
+
+    alertmanager_servers:
+      - host: c.c.c.c
+    ```
+
+    Replace the IP addresses with your actual host addresses. `global.user` must be a user that exists on every target host and has `sudo` access.
+  </Step>
+
+  <Step title="Deploy the cluster">
+    Run `tiup cluster deploy` with a cluster name, the TiKV version, and your topology file. Pass the SSH user and key with `--user` and `-i`.
+
+    ```bash
+    tiup cluster deploy foobar v4.0.0 ./topo.yaml --user ubuntu -i ~/.ssh/id_rsa
+    ```
+
+    TiUP validates the topology, checks host connectivity, and distributes the binaries to each node.
+  </Step>
+
+  <Step title="Start the cluster">
+    ```bash
+    tiup cluster start foobar
+    ```
+
+    TiUP starts PD first, waits for the PD cluster to elect a leader, then starts TiKV nodes.
+  </Step>
+</Steps>
+
+## Key TiUP commands for TiKV management
+
+| Command | Description |
+|---|---|
+| `tiup cluster list` | List all deployed clusters |
+| `tiup cluster display foobar` | Show node status and roles for cluster `foobar` |
+| `tiup cluster start foobar` | Start all nodes in the cluster |
+| `tiup cluster stop foobar` | Stop all nodes gracefully |
+| `tiup cluster restart foobar` | Rolling restart of the cluster |
+| `tiup cluster scale-out foobar scale.yaml` | Add new TiKV or PD nodes |
+| `tiup cluster scale-in foobar --node 1.2.3.4:20160` | Remove a TiKV node safely |
+| `tiup cluster upgrade foobar v7.5.0` | Rolling upgrade to a new version |
+| `tiup cluster destroy foobar` | Stop and remove the cluster and all data |
+
+## Further reading
+
+- [TiUP documentation](https://docs.pingcap.com/tidb/stable/tiup-overview)
+- [Deploy a local test environment using TiUP Playground](https://docs.pingcap.com/tidb/stable/quick-start-with-tidb#deploy-a-local-test-environment-using-tiup-playground)
+- [TiKV configuration reference](/configuration/overview)

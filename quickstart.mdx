@@ -1,80 +1,168 @@
 ---
 title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+description: "Deploy a local TiKV cluster and run your first key-value operations in minutes."
 ---
 
-## Get started in three steps
+This guide gets you from zero to a running TiKV cluster with working read/write operations. Choose the deployment method that fits your setup.
 
-Get your documentation site running locally and make your first customization.
+<Tabs>
+  <Tab title="Binary (single node)">
+    The fastest way to run TiKV is using pre-built binaries. You need both TiKV and the Placement Driver (PD).
 
-### Step 1: Set up your local environment
+    <Steps>
+      <Step title="Download binaries">
+        Set your platform and version, then download both binaries:
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+        ```bash
+        export TIKV_VERSION=v7.5.0
+        export GOOS=linux   # linux or darwin
+        export GOARCH=amd64 # amd64 or arm64
 
-### Step 2: Deploy your changes
+        curl -O https://tiup-mirrors.pingcap.com/tikv-$TIKV_VERSION-$GOOS-$GOARCH.tar.gz
+        curl -O https://tiup-mirrors.pingcap.com/pd-$TIKV_VERSION-$GOOS-$GOARCH.tar.gz
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+        tar -xzf tikv-$TIKV_VERSION-$GOOS-$GOARCH.tar.gz
+        tar -xzf pd-$TIKV_VERSION-$GOOS-$GOARCH.tar.gz
+        ```
+      </Step>
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+      <Step title="Start PD">
+        PD (Placement Driver) manages the cluster metadata and must start before TiKV:
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+        ```bash
+        ./pd-server \
+          --name=pd \
+          --data-dir=/tmp/pd/data \
+          --client-urls="http://127.0.0.1:2379" \
+          --peer-urls="http://127.0.0.1:2380" \
+          --initial-cluster="pd=http://127.0.0.1:2380" \
+          --log-file=/tmp/pd/log/pd.log
+        ```
+      </Step>
 
-### Step 3: Go live
+      <Step title="Start TiKV">
+        In a new terminal, start the TiKV server pointing at your PD endpoint:
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+        ```bash
+        ./tikv-server \
+          --pd-endpoints="127.0.0.1:2379" \
+          --addr="127.0.0.1:20160" \
+          --data-dir=/tmp/tikv/data \
+          --log-file=/tmp/tikv/log/tikv.log
+        ```
+      </Step>
+
+      <Step title="Verify and connect">
+        Check that TiKV is running by querying the status endpoint:
+
+        ```bash
+        curl http://127.0.0.1:20180/status
+        ```
+
+        Then install the Python client and try your first reads and writes:
+
+        ```bash
+        pip3 install -i https://test.pypi.org/simple/ tikv-client
+        ```
+
+        ```python
+        from tikv_client import RawClient
+
+        client = RawClient.connect(["127.0.0.1:2379"])
+
+        client.put(b'foo', b'bar')
+        print(client.get(b'foo'))  # b'bar'
+
+        client.put(b'foo', b'baz')
+        print(client.get(b'foo'))  # b'baz'
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+
+  <Tab title="Docker Compose (3-node cluster)">
+    Docker Compose spins up a production-like cluster with 3 PD nodes and 3 TiKV nodes. No building required — it uses pre-built nightly images from Docker Hub.
+
+    <Warning>
+      On macOS, use `docker compose` (with a space) instead of `docker-compose` (with a hyphen) in all commands.
+    </Warning>
+
+    <Steps>
+      <Step title="Start the cluster">
+        From the root of the TiKV repository (or any directory with the `docker-compose.yml` file):
+
+        ```bash
+        docker-compose up -d
+        ```
+
+        This starts 6 containers: `tikv-pd1`, `tikv-pd2`, `tikv-pd3`, `tikv-tikv1`, `tikv-tikv2`, `tikv-tikv3`. TiKV nodes wait for all 3 PD nodes to be healthy before starting.
+      </Step>
+
+      <Step title="Check cluster status">
+        ```bash
+        docker-compose ps
+        ```
+
+        Once all containers show `healthy`, the cluster is ready.
+
+        You can also verify the PD health endpoint:
+
+        ```bash
+        curl http://127.0.0.1:23791/pd/api/v1/health
+        ```
+      </Step>
+
+      <Step title="Connect to the cluster">
+        The cluster exposes these endpoints on localhost:
+
+        | Service | Endpoints |
+        |---------|-----------|
+        | PD client | `127.0.0.1:23791`, `127.0.0.1:23792`, `127.0.0.1:23793` |
+        | TiKV status | `http://localhost:20181/status`, `http://localhost:20182/status`, `http://localhost:20183/status` |
+
+        Install the Python client and connect to any PD endpoint:
+
+        ```bash
+        pip3 install -i https://test.pypi.org/simple/ tikv-client
+        ```
+
+        ```python
+        from tikv_client import RawClient
+
+        # Connect to one or more PD endpoints
+        client = RawClient.connect(["127.0.0.1:23791"])
+
+        client.put(b'hello', b'tikv')
+        print(client.get(b'hello'))  # b'tikv'
+        ```
+      </Step>
+
+      <Step title="Stop the cluster">
+        ```bash
+        # Stop containers (preserves data volumes)
+        docker-compose down
+
+        # Stop and remove all data
+        docker-compose down -v
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Architecture" icon="diagram-project" href="/architecture">
+    Understand how PD, Raft groups, Regions, and RocksDB fit together.
+  </Card>
+  <Card title="Deploy in production" icon="server" href="/deploy/binary">
+    Set up a multi-node production cluster with TiKV and PD.
+  </Card>
+  <Card title="Transactional API" icon="arrows-rotate" href="/reference/transactional-api">
+    Use ACID transactions for multi-key operations.
+  </Card>
+  <Card title="Configuration" icon="sliders" href="/configuration/overview">
+    Tune TiKV for your workload and environment.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

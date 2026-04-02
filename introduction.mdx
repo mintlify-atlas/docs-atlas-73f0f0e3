@@ -1,0 +1,92 @@
+---
+title: 'Introduction'
+description: 'TiKV is an open-source, distributed, transactional key-value database built in Rust and powered by the Raft consensus algorithm.'
+keywords: ['tikv', 'distributed', 'key-value', 'database', 'raft', 'ACID', 'CNCF']
+---
+
+TiKV ("Ti" stands for titanium) is an open-source, distributed, transactional key-value database. Unlike traditional NoSQL systems, TiKV provides both classical key-value APIs and transactional APIs with full ACID compliance. It is written in Rust and uses the Raft consensus algorithm to guarantee data consistency.
+
+TiKV was originally created by [PingCAP](https://en.pingcap.com) to complement [TiDB](https://github.com/pingcap/tidb), a distributed HTAP database compatible with the MySQL protocol. The design draws on distributed systems research from Google — BigTable, Spanner, and Percolator — as well as the Raft consensus algorithm.
+
+<Note>
+  TiKV is a graduated project of the [Cloud Native Computing Foundation](https://cncf.io/) (CNCF), joining projects such as Kubernetes, Prometheus, and Envoy at the highest level of maturity.
+</Note>
+
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="Geo-replication" icon="globe">
+    TiKV uses Raft and the Placement Driver to replicate data across geographic regions, keeping your data available even during regional failures.
+  </Card>
+  <Card title="Horizontal scalability" icon="arrows-maximize">
+    With PD and carefully designed Raft groups, TiKV scales horizontally to 100+ TB of data by automatically sharding and migrating regions across nodes.
+  </Card>
+  <Card title="ACID transactions" icon="shield-check">
+    TiKV supports externally-consistent distributed transactions, similar to Google Spanner. It provides snapshot isolation (SI) and externally consistent reads and writes.
+  </Card>
+  <Card title="Coprocessor" icon="cpu">
+    Similar to HBase, TiKV implements a coprocessor framework that pushes computation down to the storage layer, reducing data transfer and improving read throughput.
+  </Card>
+  <Card title="MVCC" icon="clock-rotate-left">
+    Multi-version concurrency control lets readers and writers proceed without blocking each other, enabling consistent point-in-time snapshots across the cluster.
+  </Card>
+  <Card title="RocksDB storage" icon="database">
+    Each TiKV store uses RocksDB as its local storage engine, providing fast LSM-tree-based persistence with compaction and compression.
+  </Card>
+</CardGroup>
+
+## How TiKV compares to other NoSQL systems
+
+Most traditional NoSQL key-value stores provide only single-key operations with eventual consistency. TiKV goes further:
+
+| Capability | Classical KV (e.g. Redis, Memcached) | TiKV |
+|---|---|---|
+| Key-value reads and writes | Yes | Yes |
+| Multi-key atomic transactions | No | Yes |
+| ACID compliance | No | Yes |
+| Horizontal auto-sharding | Varies | Yes |
+| Geo-replication | Varies | Yes |
+| Consistent distributed snapshots | No | Yes |
+
+TiKV exposes two API surfaces: a **Raw KV API** for workloads that need simple, high-throughput key-value access without transactions, and a **Transactional KV API** for workloads that require ACID guarantees across multiple keys.
+
+## TiKV software stack
+
+A TiKV deployment has four main concepts that compose into a cluster:
+
+- **Placement Driver (PD):** The cluster manager. PD stores cluster metadata, allocates timestamps for transactions, performs auto-sharding, and schedules region migration to balance load automatically.
+- **Node:** A physical machine in the cluster. Each node runs one or more Stores.
+- **Store:** A single TiKV process on a node. Each Store contains a RocksDB instance that writes data to local disk, and hosts many Regions.
+- **Region:** The basic unit of key-value data movement. Each Region covers a contiguous range of keys and is replicated to multiple Stores. The set of replicas for a Region forms a Raft group.
+
+When a node starts, its Node, Store, and Region metadata are registered with PD. Each Region and Store reports its status to PD regularly so PD can make scheduling decisions.
+
+## Client drivers
+
+TiKV provides official client libraries in four languages:
+
+<CardGroup cols={2}>
+  <Card title="Go client" icon="code" href="https://github.com/tikv/client-go">
+    The most stable and widely used client. Recommended for production workloads.
+  </Card>
+  <Card title="Java client" icon="code" href="https://github.com/tikv/client-java">
+    Suitable for JVM-based applications and services.
+  </Card>
+  <Card title="Rust client" icon="code" href="https://github.com/tikv/client-rust">
+    Native client for Rust applications, with both raw and transactional APIs.
+  </Card>
+  <Card title="C client" icon="code" href="https://github.com/tikv/client-c">
+    C bindings for integrating TiKV into C or C++ applications.
+  </Card>
+</CardGroup>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Run a TiKV cluster in minutes using pre-built binaries or Docker Compose, and make your first API calls.
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/architecture">
+    Understand how PD, Raft groups, Regions, RocksDB, and the MVCC layer work together.
+  </Card>
+</CardGroup>

@@ -1,97 +1,66 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "TiKV Documentation"
+description: "An open-source, distributed, transactional key-value database powered by Rust and Raft — built for horizontal scalability and ACID-compliant transactions."
 ---
 
-## Setting up
+TiKV is a distributed key-value database designed for production workloads at massive scale. Originally created to complement [TiDB](https://github.com/pingcap/tidb), TiKV provides both classic key-value APIs and fully ACID-compliant distributed transactions. It is a graduated project of the [Cloud Native Computing Foundation (CNCF)](https://cncf.io/).
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Deploy a local TiKV cluster and run your first key-value operations in minutes.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Architecture" icon="diagram-project" href="/architecture">
+    Understand TiKV's distributed architecture, Raft consensus, and storage layers.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Deploy TiKV" icon="server" href="/deploy/binary">
+    Deploy TiKV using binary, Docker Compose, or TiUP cluster manager.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Client APIs" icon="code" href="/reference/raw-api">
+    Explore the Raw KV and Transactional KV APIs for application integration.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Key features
 
-Everything you need to create world-class documentation.
+<CardGroup cols={2}>
+  <Card title="Raft consensus" icon="shield-check" href="/concepts/raft-consensus">
+    Strong consistency via Raft with automatic leader election and log replication.
+  </Card>
+  <Card title="Distributed transactions" icon="arrows-rotate" href="/concepts/mvcc-transactions">
+    ACID transactions using the Percolator model with MVCC snapshot isolation.
+  </Card>
+  <Card title="Horizontal scalability" icon="arrows-left-right" href="/concepts/region-management">
+    Auto-sharding via Placement Driver scales to 100+ TBs seamlessly.
+  </Card>
+  <Card title="Coprocessor" icon="microchip" href="/concepts/coprocessor">
+    Push computation to storage nodes to reduce data movement and latency.
+  </Card>
+</CardGroup>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## Deploy and operate
 
-## Need inspiration?
+<CardGroup cols={2}>
+  <Card title="Docker Compose" icon="docker" href="/deploy/docker-compose">
+    Spin up a full 3-node cluster locally using Docker Compose.
+  </Card>
+  <Card title="Configuration" icon="sliders" href="/configuration/overview">
+    Tune TiKV for your workload — storage, Raft, memory, and more.
+  </Card>
+  <Card title="Monitoring" icon="chart-line" href="/operations/monitoring">
+    Monitor your cluster with Prometheus and Grafana dashboards.
+  </Card>
+  <Card title="Backup & Restore" icon="database" href="/operations/backup-restore">
+    Protect your data with full backups and point-in-time recovery.
+  </Card>
+</CardGroup>
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+## Reference
+
+<CardGroup cols={2}>
+  <Card title="tikv-ctl" icon="terminal" href="/reference/tikv-ctl/overview">
+    Command-line tool for inspecting and managing a TiKV cluster.
+  </Card>
+  <Card title="Configuration reference" icon="file-code" href="/reference/config/server">
+    Complete reference for all TiKV configuration options.
+  </Card>
+</CardGroup>

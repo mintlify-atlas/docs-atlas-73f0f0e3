@@ -1,0 +1,232 @@
+---
+title: "Architecture"
+description: "How TiKV layers — Placement Driver, Raft groups, Regions, RocksDB, and MVCC — combine to deliver a distributed, transactional key-value store."
+---
+
+TiKV is built from several composable layers. Each layer has a well-defined responsibility, and together they deliver geo-replication, horizontal scalability, ACID transactions, and consistent snapshots.
+
+## High-level cluster layout
+
+A TiKV deployment consists of one Placement Driver (PD) cluster and one or more TiKV nodes. Clients communicate with PD to discover routing information, then send reads and writes directly to TiKV nodes over gRPC.
+
+```
+┌──────────────────────────────────────────┐
+│              Client                      │
+│  (Go / Java / Rust / C / Python)         │
+└────────────────┬─────────────────────────┘
+                 │ gRPC
+        ┌────────┴────────┐
+        │  Placement      │
+        │  Driver (PD)    │  ← cluster metadata, TSO, scheduling
+        └────────┬────────┘
+                 │ region routing
+     ┌───────────┼───────────┐
+     ▼           ▼           ▼
+  TiKV Node   TiKV Node   TiKV Node
+  (Store +    (Store +    (Store +
+   Regions)    Regions)    Regions)
+```
+
+## Core components
+
+<CardGroup cols={2}>
+  <Card title="Placement Driver (PD)" icon="compass">
+    The cluster manager. PD allocates globally-monotonic timestamps, stores region routing tables, and continuously rebalances regions across nodes.
+  </Card>
+  <Card title="Node" icon="server">
+    A physical machine in the cluster. Each node runs one or more TiKV Store processes and participates in one or more Raft groups.
+  </Card>
+  <Card title="Store" icon="hard-drive">
+    A single `tikv-server` process on a node. Each Store wraps a RocksDB instance and hosts many Regions. Metadata for the Store is registered with PD on startup.
+  </Card>
+  <Card title="Region" icon="table-cells">
+    The basic unit of key-value data movement. Each Region covers a contiguous range of keys and is replicated to multiple Stores, forming a Raft group.
+  </Card>
+</CardGroup>
+
+## Placement Driver (PD)
+
+PD is the brain of a TiKV cluster. It has three primary roles:
+
+1. **Cluster metadata store.** PD records which Region lives on which Store. Clients query PD for a Region's leader before sending requests.
+2. **Timestamp oracle (TSO).** PD provides strictly increasing timestamps used by the Percolator-inspired transaction protocol to order commits.
+3. **Scheduler.** PD periodically inspects Region and Store health reports, then issues commands to move, split, or merge Regions to keep load and data balanced across nodes.
+
+<Info>
+  PD itself runs as a Raft group for high availability. You should deploy at least three PD instances in production, as shown in the Docker Compose setup in the [quickstart](/quickstart).
+</Info>
+
+## Raft consensus
+
+TiKV uses the [Raft](https://raft.github.io/) consensus algorithm, implemented in the [`raft-rs`](https://github.com/tikv/raft-rs) crate, to replicate data. Each Region maps to exactly one Raft group. The Raft group has one leader and two or more followers (typically three replicas in total).
+
+When a client writes to a Region:
+
+1. The write is routed to the Raft leader for that Region.
+2. The leader appends the entry to its Raft log.
+3. The leader replicates the entry to a quorum of followers.
+4. Once a quorum acknowledges the entry, the leader applies it to RocksDB and responds to the client.
+
+```
+Client write
+     │
+     ▼
+Raft Leader (Store A)
+     │  replicate log entry
+     ├──────────────► Follower (Store B)
+     │                    │ ack
+     └──────────────► Follower (Store C)
+                          │ ack
+     quorum reached → apply to RocksDB → respond to client
+```
+
+<Note>
+  Raft log entries are persisted to the `raft-engine` before being sent to followers, ensuring durability even if the leader crashes before a quorum is reached.
+</Note>
+
+## Region management
+
+A Region is the atomic unit of data movement and replication in TiKV. Each Region:
+
+- Covers a contiguous key range, encoded as `[start_key, end_key)`.
+- Is replicated to exactly `max-replicas` Stores (default: 3).
+- Automatically splits when it exceeds `coprocessor.region-max-size` (default: 384 MB).
+- Each sub-region targets `coprocessor.region-split-size` (default: 256 MB).
+- Can be merged with adjacent Regions when it shrinks below a minimum size.
+
+```
+Before split:
+  Region 1: [a, z)   (384 MB — at threshold)
+
+After split:
+  Region 1: [a, m)   (~256 MB)
+  Region 2: [m, z)   (~128 MB)
+```
+
+PD detects the split, assigns new Region IDs, and schedules the new Regions onto Stores to keep data balanced. All of this happens transparently — clients re-fetch routing information from PD on the next request.
+
+## Storage layer: RocksDB
+
+Each Store holds a single RocksDB instance. RocksDB is a log-structured merge-tree (LSM-tree) engine that provides fast sequential writes through an in-memory write buffer (memtable) that is periodically flushed to SST files and compacted.
+
+TiKV uses three RocksDB column families to separate data by type:
+
+| Column family | Contents |
+|---|---|
+| `default` | Actual key-value data (the value written by the user). |
+| `write` | MVCC write records: commit timestamps and pointers to `default`. |
+| `lock` | MVCC lock records for in-progress transactions. |
+
+<Tip>
+  The separation of lock and write records into dedicated column families allows TiKV to scan locks efficiently during transaction conflict detection without reading value data.
+</Tip>
+
+## MVCC layer
+
+TiKV's storage module (`src/storage/`) is split into three sub-layers as documented in [`src/storage/mod.rs`](https://github.com/tikv/tikv/blob/master/src/storage/mod.rs):
+
+- **`txn`** — lowers transactional commands to key-value operations on the MVCC abstraction, manages latches, and handles deadlock detection.
+- **`mvcc`** — the MVCC implementation itself (`MvccTxn`), which attaches timestamps to keys and values to maintain multiple versions.
+- **`kv`** — the engine abstraction trait (`Engine`) over RocksDB.
+
+Every key in the `default` and `write` column families is encoded with a timestamp suffix. A read at timestamp `T` sees only versions with commit timestamp `≤ T`, ignoring later writes. This enables consistent snapshot reads without blocking concurrent writes.
+
+```
+Key encoding:
+  user_key + timestamp → value
+
+Example keys in 'write' CF:
+  "foo" @ ts=10  → WriteRecord { commit_ts: 10, short_value: b"bar" }
+  "foo" @ ts=20  → WriteRecord { commit_ts: 20, short_value: b"baz" }
+
+Read at ts=15 returns b"bar" (the version at ts=10).
+Read at ts=25 returns b"baz" (the version at ts=20).
+```
+
+## Transaction model
+
+TiKV's transaction protocol is inspired by [Google Percolator](https://research.google/pubs/large-scale-incremental-processing-using-distributed-transactions-and-notifications/), adapted with performance improvements. It is a two-phase commit (2PC) protocol built on top of MVCC:
+
+**Phase 1 — Prewrite:**
+- The client chooses a `start_ts` from PD's timestamp oracle.
+- For each key in the transaction, TiKV writes a lock record to the `lock` CF with the `start_ts`.
+- If any key is already locked or has a newer write, the transaction aborts.
+
+**Phase 2 — Commit:**
+- The client obtains a `commit_ts` from PD.
+- TiKV writes a write record to the `write` CF with `commit_ts` pointing to the value written in Prewrite.
+- The lock records are removed.
+
+```
+Prewrite (start_ts=10):
+  lock CF: "foo" @ 10 → Lock { primary: "foo", start_ts: 10 }
+  default CF: "foo" @ 10 → b"bar"
+
+Commit (commit_ts=15):
+  write CF: "foo" @ 15 → Write { start_ts: 10, write_type: Put }
+  lock CF: "foo" @ 10 → (deleted)
+```
+
+TiKV also supports snapshot isolation with lock (`SELECT ... FOR UPDATE`) and externally consistent reads, making it suitable as the storage layer for SQL databases.
+
+## gRPC communication layer
+
+All client-to-TiKV and PD-to-TiKV communication uses [gRPC](https://grpc.io/), provided by the [`grpc-rs`](https://github.com/tikv/grpc-rs) crate. The protobuf service definitions live in the [`kvproto`](https://github.com/pingcap/kvproto) repository and define two main service groups:
+
+- **`TiKV` service** — raw key-value operations (`RawGet`, `RawPut`, `RawDelete`) and transactional operations (`KvPrewrite`, `KvCommit`, `KvGet`, `KvScan`).
+- **`TiKV` coprocessor service** — `Coprocessor` and `CoprocessorStream` RPCs for push-down computation.
+
+The server implementation lives in `src/server/` (`src/server/service/kv.rs` handles KV RPC dispatch).
+
+## Coprocessor framework
+
+The coprocessor (`src/coprocessor/`) handles read requests that require computation at the storage layer rather than returning raw key-value data to the client. Most TiDB read queries use the coprocessor to avoid transferring large volumes of unfiltered data over the network.
+
+A coprocessor request follows this path:
+
+1. The client sends a `Coprocessor` RPC containing a DAG request, analyze request, or checksum request.
+2. TiKV's `Endpoint` parses the request and retrieves a consistent snapshot from RocksDB at the requested timestamp.
+3. The appropriate handler (table scan, index scan, aggregation, etc.) runs on a read thread pool.
+4. Results are streamed or returned in a single response.
+
+<Info>
+  TiKV also supports a plugin-based Coprocessor V2 system (`src/coprocessor_v2/`) that allows dynamically loading custom computation logic as shared libraries without recompiling TiKV.
+</Info>
+
+## API versions
+
+TiKV exposes two distinct API surfaces, selectable at the client level:
+
+<AccordionGroup>
+  <Accordion title="Raw KV API">
+    Single-key operations without MVCC or transaction semantics. Use this API when you need the highest throughput and do not require atomic multi-key operations.
+
+    Supported operations: `RawGet`, `RawPut`, `RawDelete`, `RawBatchGet`, `RawBatchPut`, `RawBatchDelete`, `RawScan`, `RawDeleteRange`.
+
+    ```python
+    from tikv_client import RawClient
+
+    client = RawClient.connect(["127.0.0.1:2379"])
+    client.put(b'foo', b'bar')
+    print(client.get(b'foo'))  # b'bar'
+    ```
+  </Accordion>
+  <Accordion title="Transactional KV API">
+    Multi-key operations with full ACID semantics via the Percolator-inspired 2PC protocol. Use this API when you need atomic reads and writes across multiple keys.
+
+    Supported operations: `KvGet`, `KvScan`, `KvPrewrite`, `KvCommit`, `KvCheckTxnStatus`, `KvResolveLock`, and more.
+
+    The transaction protocol is implemented in `src/storage/txn/` and coordinates with PD's timestamp oracle for globally consistent ordering.
+  </Accordion>
+</AccordionGroup>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Run a TiKV cluster locally and make your first API calls.
+  </Card>
+  <Card title="Configuration" icon="sliders" href="/configuration/overview">
+    Tune RocksDB, Raft, and transaction parameters for your workload.
+  </Card>
+</CardGroup>

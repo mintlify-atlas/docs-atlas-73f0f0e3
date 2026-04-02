@@ -1,0 +1,219 @@
+---
+title: "Scaling"
+description: "How to add and remove TiKV nodes, how PD rebalances regions, and how to manage multi-datacenter deployments and resource quotas."
+keywords: ["scaling", "horizontal scaling", "placement driver", "PD", "region rebalancing", "add node", "remove node", "decommission", "multi-datacenter", "resource control"]
+---
+
+TiKV scales horizontally by adding stores. Placement Driver (PD) acts as the cluster manager: it tracks every store's capacity and load, maintains the region replica placement map, and issues scheduling commands to rebalance regions automatically. You do not need to manually move data.
+
+## How TiKV scales
+
+Each physical or virtual machine runs one or more `tikv-server` processes. Each process is a **store**. A store owns a RocksDB instance on local disk and holds a portion of the cluster's regions.
+
+When TiKV starts, it registers itself with PD by calling `put_store`, sending its address, capacity, and labels. PD assigns the store a numeric ID and begins tracking it. From that point forward, the store sends periodic heartbeats (`store_heartbeat`) that carry disk usage, QPS, and region count statistics. PD uses these statistics to make rebalancing decisions.
+
+```
+tikv-server ──── register (put_store) ──── PD
+tikv-server ──── heartbeat every 10 s ──── PD
+```
+
+Region replicas are spread across stores according to PD's scheduling rules. Each region targets a configurable replication factor (typically 3). PD ensures no two replicas of the same region land on the same store, and it balances the number of regions and leaders across stores.
+
+## Adding a TiKV node
+
+<Steps>
+  <Step title="Provision the new node">
+    Install `tikv-server` on the new host. Ensure the disk, network, and firewall meet your cluster's requirements.
+  </Step>
+  <Step title="Configure tikv.toml">
+    Point the new node at the PD cluster and set its data directory.
+
+    ```toml
+    [server]
+    addr = "0.0.0.0:20160"
+    status-addr = "0.0.0.0:20180"
+
+    [pd]
+    endpoints = ["pd1:2379", "pd2:2379", "pd3:2379"]
+
+    [storage]
+    data-dir = "/data/tikv"
+    ```
+
+    If your cluster uses placement labels for datacenter-aware replication, add them:
+
+    ```toml
+    [server]
+    labels = { zone = "us-east-1a", rack = "rack-3" }
+    ```
+  </Step>
+  <Step title="Start tikv-server">
+    ```bash
+    tikv-server --config /etc/tikv/tikv.toml \
+      --log-file /var/log/tikv/tikv.log
+    ```
+
+    On startup, TiKV contacts PD and registers the new store. PD immediately begins considering the new store as a replica target.
+  </Step>
+  <Step title="Verify the store is online">
+    ```bash
+    pd-ctl -u http://pd-host:2379 store
+    ```
+
+    The new store appears with state `Up`. Its region count starts at zero and grows as PD migrates replicas to it.
+  </Step>
+</Steps>
+
+<Note>
+PD migrates regions by instructing existing stores to send snapshots to the new store. This generates network and disk I/O on both the source and the new store. If the cluster is under heavy write load, add nodes during a maintenance window.
+</Note>
+
+## Region rebalancing
+
+After you add a store, PD automatically schedules region moves to balance the cluster. Rebalancing happens in the background with no downtime. PD issues `AddPeer` and `RemovePeer` commands to Raft groups; only when a new replica is caught up and confirmed does PD remove the old one.
+
+PD balances three resources independently:
+
+- **Region count** — the number of regions per store.
+- **Leader count** — the number of region leaders per store, which drives write and read traffic.
+- **Store size** — disk usage, so no single store fills up faster than others.
+
+You can inspect the current balance status:
+
+```bash
+pd-ctl -u http://pd-host:2379 operator show
+```
+
+To manually trigger a region scatter (useful after adding multiple nodes at once):
+
+```bash
+pd-ctl -u http://pd-host:2379 scheduler add scatter-range-scheduler
+```
+
+## Removing a node
+
+To remove a TiKV store gracefully, you must first transfer all of its data to other stores, then mark it as tombstone.
+
+<Steps>
+  <Step title="Tell PD to evacuate the store">
+    Replace `<store-id>` with the numeric ID shown by `pd-ctl store`.
+
+    ```bash
+    pd-ctl -u http://pd-host:2379 store delete <store-id>
+    ```
+
+    PD sets the store state to `Offline` and begins scheduling all of its regions away to other stores.
+  </Step>
+  <Step title="Wait for evacuation to complete">
+    Monitor the store's region count until it reaches zero:
+
+    ```bash
+    watch -n 5 'pd-ctl -u http://pd-host:2379 store <store-id>'
+    ```
+
+    Evacuation time depends on cluster size and network bandwidth. A store with hundreds of GiB of data can take tens of minutes to hours.
+  </Step>
+  <Step title="Stop tikv-server">
+    Once the region count is zero and the store state is `Tombstone`, shut down the process.
+
+    ```bash
+    systemctl stop tikv-server
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+Do not kill `tikv-server` before PD finishes evacuating the store. Forcing a shutdown while regions are still assigned risks making those regions temporarily under-replicated. PD will eventually rebuild the replicas, but the cluster will be in a degraded state until it does.
+</Warning>
+
+## Scaling storage per node
+
+If a node is running low on disk space but you cannot add more nodes immediately, you can expand the underlying block device or mount a larger volume.
+
+After expanding the filesystem, TiKV automatically detects the new available capacity on the next store heartbeat. No restart is required for RocksDB to use the additional space — compaction naturally spills into the newly available area.
+
+Monitor `tikv_store_size_bytes{type="available"}` and the `TiKV_low_space` alert (fires when available / capacity < 20%).
+
+## Load balancing
+
+PD distributes read and write traffic by controlling which store holds the Raft leader of each region. Because only the leader serves client requests, leader placement determines load distribution.
+
+PD's leader scheduler moves leaders away from overloaded stores toward underloaded ones. You can observe the distribution:
+
+```bash
+pd-ctl -u http://pd-host:2379 store --state=Up
+```
+
+Look at the `leader_count` field for each store. A well-balanced cluster has similar leader counts across stores with comparable hardware.
+
+To manually evict leaders from a specific store (for maintenance):
+
+```bash
+pd-ctl -u http://pd-host:2379 scheduler add evict-leader-scheduler <store-id>
+```
+
+Remove the scheduler when maintenance is done:
+
+```bash
+pd-ctl -u http://pd-host:2379 scheduler remove evict-leader-scheduler-<store-id>
+```
+
+## Multi-datacenter deployment
+
+TiKV uses store **labels** to implement datacenter-aware replication. Labels are arbitrary key-value pairs you attach to each store. PD's placement rules use labels to ensure that replicas are distributed across failure domains.
+
+### Configure labels on stores
+
+```toml
+[server]
+labels = { zone = "us-east-1a", dc = "us-east-1" }
+```
+
+### Tell PD about the label hierarchy
+
+```bash
+pd-ctl -u http://pd-host:2379 config set location-labels zone,dc
+```
+
+With this configuration, PD places no two replicas of the same region in the same `zone`. If your cluster spans three zones, this guarantees that losing any one zone does not lose quorum for any region.
+
+<Tip>
+For a five-replica deployment across two datacenters, configure the placement rules to require at least two replicas in the primary datacenter and two in the secondary. The fifth replica provides quorum in split-brain scenarios.
+</Tip>
+
+## Resource control and quota management
+
+TiKV supports resource groups to isolate workloads and prevent noisy neighbors from consuming all cluster resources. The `resource_control` component (`components/resource_control/`) implements RU (Request Unit) based quota enforcement.
+
+### How resource groups work
+
+Each resource group has an RU quota that caps how many request units it can consume per second. RU combines CPU time, I/O bytes, and network bytes into a single abstract unit. Requests that exceed the group's quota are delayed until budget replenishes.
+
+TiKV exposes current resource group state on the HTTP status endpoint:
+
+```bash
+curl http://127.0.0.1:20180/resource_groups
+```
+
+### Priority control strategies
+
+The `resource-control.priority-ctl-strategy` configuration controls how quota is granted to low-priority tasks.
+
+| Strategy | Behavior |
+|----------|----------|
+| `conservative` | Strictly prioritizes high-priority tasks. Low-priority tasks run much slower when high-priority traffic is present. |
+| `moderate` (default) | Balances overall throughput with high-priority latency. |
+| `aggressive` | Maximizes overall throughput; high-priority latency may increase slightly under load. |
+
+```toml
+[resource-control]
+priority-ctl-strategy = "moderate"
+```
+
+### Monitor resource group usage
+
+The Grafana **Resource Control** row in `tikv_details.json` includes panels for:
+
+- `Priority Quota Limit` — current quota limit per priority tier.
+- `Background Task Total Wait Duration` — time background tasks spend waiting for quota.
+- `Analyze read ops per second` — coprocessor read operations broken down by regular vs. block reads.

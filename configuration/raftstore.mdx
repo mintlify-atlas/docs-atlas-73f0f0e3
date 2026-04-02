@@ -1,0 +1,207 @@
+---
+title: "Raftstore configuration"
+description: "Configure TiKV's Raft consensus layer: tick intervals, election timeouts, log GC, region splitting, and region hibernation."
+---
+
+The `[raftstore]` section controls how TiKV runs the Raft consensus algorithm across regions. These settings govern leader elections, heartbeat cadence, snapshot behavior, log compaction, region splitting, and the hibernation of idle regions.
+
+## Tick interval and election timing
+
+TiKV drives all Raft timers with a single base tick. Heartbeat and election timeouts are expressed as multiples of this base tick.
+
+<ParamField path="raftstore.raft-base-tick-interval" type="string" default="1s">
+  Base tick interval that drives all Raft timers. Heartbeat and election timeouts are computed as multiples of this value. Reducing this value increases Raft responsiveness but also increases CPU usage.
+</ParamField>
+
+<ParamField path="raftstore.raft-heartbeat-ticks" type="number" default="2">
+  Number of base ticks between leader heartbeat messages. With the default values, leaders send a heartbeat every `1s × 2 = 2s`.
+</ParamField>
+
+<ParamField path="raftstore.raft-election-timeout-ticks" type="number" default="10">
+  Number of base ticks a follower waits without a heartbeat before starting an election. With the defaults, followers time out after `1s × 10 = 10s`. Must be greater than `raft-heartbeat-ticks`.
+
+  TiKV randomizes the actual timeout between `[raft-election-timeout-ticks, 2 × raft-election-timeout-ticks)` to reduce split-vote scenarios.
+</ParamField>
+
+<Note>
+  Raft election timeout determines how quickly TiKV detects a leader failure. Lowering `raft-election-timeout-ticks` or `raft-base-tick-interval` reduces failover time but increases sensitivity to transient network delays.
+</Note>
+
+```toml
+[raftstore]
+raft-base-tick-interval = "1s"
+raft-heartbeat-ticks = 2
+raft-election-timeout-ticks = 10
+```
+
+## Message size limits
+
+<ParamField path="raftstore.raft-max-size-per-msg" type="string" default="1MB">
+  Maximum size of a single Raft message. Messages larger than this are rejected. Increasing this value can improve throughput for large batch writes but raises per-message memory usage.
+</ParamField>
+
+<ParamField path="raftstore.raft-entry-max-size" type="string" default="8MB">
+  Maximum size of a single Raft log entry. TiKV rejects proposals that exceed this limit. Requests larger than this value must be split before being submitted.
+</ParamField>
+
+```toml
+[raftstore]
+raft-max-size-per-msg = "1MB"
+raft-entry-max-size = "8MB"
+```
+
+## Raft log GC
+
+TiKV periodically garbage-collects committed Raft log entries that have been applied and are no longer needed for replication.
+
+<ParamField path="raftstore.raft-log-gc-threshold" type="number" default="50">
+  Minimum number of Raft log entries that must accumulate before GC runs. Must be at least `1`. Keep this low for clusters with constrained disk space; raise it to reduce GC frequency on write-heavy workloads.
+</ParamField>
+
+<ParamField path="raftstore.raft-log-gc-count-limit" type="number" default="196608">
+  When the number of accumulated log entries exceeds this value, GC is forced even if the tick interval has not elapsed.
+</ParamField>
+
+<ParamField path="raftstore.raft-log-gc-size-limit" type="string" default="192MB">
+  When the total approximate size of accumulated log entries exceeds this value, GC is forced. Recommended to be set to 3/4 of `region-split-size`.
+</ParamField>
+
+<ParamField path="raftstore.raft-log-gc-tick-interval" type="string" default="3s">
+  How often TiKV checks whether Raft log GC should run.
+</ParamField>
+
+<ParamField path="raftstore.raft-log-compact-sync-interval" type="string" default="2s">
+  Interval at which TiKV compacts unnecessary Raft log entries.
+</ParamField>
+
+```toml
+[raftstore]
+raft-log-gc-threshold = 50
+raft-log-gc-count-limit = 196608
+raft-log-gc-size-limit = "192MB"
+raft-log-gc-tick-interval = "3s"
+```
+
+## Region splitting
+
+When a region grows beyond `region-max-size`, TiKV splits it into multiple smaller regions of approximately `region-split-size`. The coprocessor's `[coprocessor]` section defines these thresholds globally; you can override the split-check interval in `[raftstore]`.
+
+<ParamField path="raftstore.region-split-check-diff" type="string" default="16MB">
+  How much a region's size must change before TiKV re-evaluates whether to split it. Set to 1/16 of `region-split-size`. Lowering this value increases split-check frequency but allows TiKV to catch fast-growing regions sooner.
+</ParamField>
+
+<ParamField path="raftstore.split-region-check-tick-interval" type="string" default="10s">
+  How often TiKV checks whether any region should be split.
+</ParamField>
+
+<Note>
+  The region size thresholds themselves (`region-max-size` and `region-split-size`) are configured under `[coprocessor]`, not `[raftstore]`. The defaults are `384MB` and `256MB` respectively.
+</Note>
+
+```toml
+[raftstore]
+region-split-check-diff = "16MB"
+split-region-check-tick-interval = "10s"
+
+[coprocessor]
+region-max-size = "384MB"
+region-split-size = "256MB"
+```
+
+## PD heartbeats
+
+<ParamField path="raftstore.pd-heartbeat-tick-interval" type="string" default="60s">
+  How often each region leader sends a heartbeat to PD. PD uses these heartbeats to track region health and apply scheduling operators. Reducing this interval makes scheduling more responsive but increases PD load.
+</ParamField>
+
+<ParamField path="raftstore.pd-store-heartbeat-tick-interval" type="string" default="10s">
+  How often the store (TiKV node) sends a store-level heartbeat to PD. PD uses store heartbeats to monitor capacity, I/O statistics, and node health.
+</ParamField>
+
+```toml
+[raftstore]
+pd-heartbeat-tick-interval = "60s"
+pd-store-heartbeat-tick-interval = "10s"
+```
+
+## Region hibernation
+
+Idle regions consume CPU even when they have no traffic. Hibernation suspends the Raft tick loop for regions that have been quiet for a period, reducing background CPU usage in clusters with many regions.
+
+<ParamField path="raftstore.hibernate-regions" type="boolean" default="true">
+  When enabled, TiKV hibernates idle regions by pausing their Raft tick loop. Hibernated regions wake up when they receive a message or a write request. This is enabled by default and is particularly valuable on nodes with thousands of regions.
+</ParamField>
+
+<Tip>
+  Hibernation is most beneficial for clusters with a large number of regions and low write throughput. In high-traffic clusters it has minimal effect, since regions rarely become idle long enough to hibernate.
+</Tip>
+
+```toml
+[raftstore]
+hibernate-regions = true
+```
+
+## Peer lifecycle
+
+<ParamField path="raftstore.max-peer-down-duration" type="string" default="10m">
+  How long a peer can be unreachable before it is reported to PD as down. PD may then schedule a replacement peer.
+</ParamField>
+
+<ParamField path="raftstore.apply-pool-size" type="number" default="2">
+  Number of threads in the apply pool, which applies committed Raft log entries to the state machine. Increase this on write-heavy workloads.
+</ParamField>
+
+<ParamField path="raftstore.store-pool-size" type="number" default="2">
+  Number of threads in the store pool, which handles incoming Raft messages.
+</ParamField>
+
+<ParamField path="raftstore.store-io-pool-size" type="number" default="1">
+  Number of threads for Raft I/O tasks (writing to the Raft log). Set to `0` to handle I/O on store threads directly.
+</ParamField>
+
+```toml
+[raftstore]
+apply-pool-size = 2
+store-pool-size = 2
+store-io-pool-size = 1
+max-peer-down-duration = "10m"
+```
+
+## Complete raftstore example
+
+```toml
+[raftstore]
+# Tick interval and election timing
+raft-base-tick-interval = "1s"
+raft-heartbeat-ticks = 2
+raft-election-timeout-ticks = 10
+
+# Message limits
+raft-max-size-per-msg = "1MB"
+raft-entry-max-size = "8MB"
+
+# Log GC
+raft-log-gc-threshold = 50
+raft-log-gc-count-limit = 196608
+raft-log-gc-size-limit = "192MB"
+raft-log-gc-tick-interval = "3s"
+
+# Region split check
+region-split-check-diff = "16MB"
+split-region-check-tick-interval = "10s"
+
+# PD heartbeats
+pd-heartbeat-tick-interval = "60s"
+pd-store-heartbeat-tick-interval = "10s"
+
+# Hibernation and thread pools
+hibernate-regions = true
+apply-pool-size = 2
+store-pool-size = 2
+store-io-pool-size = 1
+max-peer-down-duration = "10m"
+
+[coprocessor]
+region-max-size = "384MB"
+region-split-size = "256MB"
+```

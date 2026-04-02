@@ -1,0 +1,232 @@
+---
+title: "Security configuration"
+description: "Configure TLS for peer and client connections, and encryption at rest with AES or SM4 using plaintext, file, or KMS master keys."
+---
+
+TiKV's `[security]` section covers two independent concerns: TLS for in-flight encryption of gRPC connections, and encryption at rest for data stored on disk.
+
+## TLS configuration
+
+TiKV uses mutual TLS (mTLS) to secure gRPC connections between TiKV nodes and between TiDB and TiKV. All three certificate files must be provided together.
+
+<ParamField path="security.ca-path" type="string" default='""'>
+  Path to the PEM-encoded Certificate Authority certificate file. Used to verify the certificate presented by connecting peers. An empty string disables TLS.
+</ParamField>
+
+<ParamField path="security.cert-path" type="string" default='""'>
+  Path to the PEM-encoded server certificate file. Presented to peers during the TLS handshake.
+</ParamField>
+
+<ParamField path="security.key-path" type="string" default='""'>
+  Path to the PEM-encoded private key file corresponding to `cert-path`.
+</ParamField>
+
+<ParamField path="security.cert-allowed-cn" type="string[]" default="[]">
+  List of Common Name (CN) values that TiKV accepts from connecting clients or peers. When non-empty, TiKV rejects connections whose certificate CN is not in this list.
+</ParamField>
+
+<Warning>
+  All three of `ca-path`, `cert-path`, and `key-path` must be set for TLS to activate. Setting only some of them causes TiKV to fail validation at startup.
+</Warning>
+
+```toml
+[security]
+ca-path = "/etc/tikv/certs/ca.pem"
+cert-path = "/etc/tikv/certs/server.pem"
+key-path = "/etc/tikv/certs/server-key.pem"
+cert-allowed-cn = ["tikv-node", "tidb-node"]
+```
+
+### Generating certificates
+
+You can generate a self-signed CA and server certificates using `openssl` or `cfssl`. TiUP-managed clusters handle certificate generation automatically.
+
+```bash
+# Generate CA key and certificate
+openssl genrsa -out ca-key.pem 4096
+openssl req -new -x509 -days 3650 -key ca-key.pem -out ca.pem \
+  -subj "/CN=TiKV CA"
+
+# Generate server key and certificate signing request
+openssl genrsa -out server-key.pem 2048
+openssl req -new -key server-key.pem -out server.csr \
+  -subj "/CN=tikv-node"
+
+# Sign the server certificate with the CA
+openssl x509 -req -days 365 -in server.csr \
+  -CA ca.pem -CAkey ca-key.pem -CAcreateserial \
+  -out server.pem
+```
+
+## Encryption at rest
+
+Encryption at rest protects data stored in RocksDB SST files and Raft log files. TiKV encrypts data using a data key that is itself encrypted with a master key. This two-level key hierarchy means you can rotate the master key without re-encrypting all data.
+
+<Note>
+  Encryption at rest protects data on disk. It does not protect data in transit — use TLS for that. Enable both for comprehensive security.
+</Note>
+
+### Encryption method
+
+<ParamField path="security.encryption.data-encryption-method" type="string" default="plaintext">
+  Encryption algorithm for data files. Options:
+  - `plaintext` — No encryption (default). Setting any other value enables encryption.
+  - `aes128-ctr` — AES with a 128-bit key in CTR mode.
+  - `aes192-ctr` — AES with a 192-bit key in CTR mode.
+  - `aes256-ctr` — AES with a 256-bit key in CTR mode.
+  - `sm4-ctr` — SM4 algorithm in CTR mode (Chinese national standard).
+
+  When this is set to anything other than `plaintext`, you must also configure a master key.
+</ParamField>
+
+<ParamField path="security.encryption.data-key-rotation-period" type="string" default="7d">
+  How often TiKV rotates the data encryption key. More frequent rotation limits the amount of data encrypted under a single key but increases key management overhead.
+</ParamField>
+
+```toml
+[security.encryption]
+data-encryption-method = "aes256-ctr"
+data-key-rotation-period = "7d"
+```
+
+### Master key types
+
+The master key encrypts the data key. TiKV supports three master key types.
+
+<AccordionGroup>
+  <Accordion title="Plaintext master key">
+    No master key encryption. Use only when `data-encryption-method = "plaintext"` (i.e., encryption at rest is disabled). This is the default.
+
+    ```toml
+    [security.encryption.master-key]
+    type = "plaintext"
+    ```
+  </Accordion>
+
+  <Accordion title="File master key">
+    The master key is stored in a local file. The file must contain a 256-bit (32-byte) key encoded as a hexadecimal string followed by a newline.
+
+    <Warning>
+      A file master key defeats the purpose of encryption at rest if the file is stored on the same disk as TiKV data. Use this only if the key file is stored on a separate secure medium (such as a memory-backed filesystem like `tmpfs`).
+    </Warning>
+
+    ```toml
+    [security.encryption.master-key]
+    type = "file"
+    path = "/secure/mount/master-key.hex"
+    ```
+
+    To generate a valid key file:
+
+    ```bash
+    # Generate 32 random bytes, encode as hex, append newline
+    openssl rand -hex 32 > /secure/mount/master-key.hex
+    ```
+  </Accordion>
+
+  <Accordion title="KMS master key (AWS KMS)">
+    The master key is managed by AWS Key Management Service (KMS). TiKV calls KMS to encrypt and decrypt the data key. The TiKV process must have IAM permissions to use the specified CMK.
+
+    This is the recommended master key type for production deployments.
+
+    <ParamField path="security.encryption.master-key.key-id" type="string" required>
+      AWS KMS Customer Master Key (CMK) ID. Must be a valid KMS key ID that the TiKV process can access via IAM.
+    </ParamField>
+
+    <ParamField path="security.encryption.master-key.region" type="string" required>
+      AWS region where the KMS key is located (e.g., `us-west-2`).
+    </ParamField>
+
+    <ParamField path="security.encryption.master-key.endpoint" type="string">
+      Optional. Custom KMS endpoint URL. Required only when using a non-default KMS endpoint, such as a VPC endpoint or a local mock.
+    </ParamField>
+
+    ```toml
+    [security.encryption.master-key]
+    type = "kms"
+    key-id = "1234abcd-12ab-34cd-56ef-1234567890ab"
+    region = "us-west-2"
+    endpoint = "https://kms.us-west-2.amazonaws.com"
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### Master key rotation
+
+To rotate the master key without downtime:
+
+<Steps>
+  <Step title="Configure the new master key">
+    Add the new master key under `[security.encryption.master-key]` in your config file.
+  </Step>
+  <Step title="Configure the old master key">
+    Move the old master key configuration to `[security.encryption.previous-master-key]`. TiKV uses this key once at startup to decrypt the existing data key, then re-encrypts it with the new master key.
+  </Step>
+  <Step title="Restart TiKV">
+    TiKV reads both keys on startup, performs the re-encryption, and discards the previous master key reference.
+  </Step>
+  <Step title="Remove the previous master key">
+    After confirming TiKV has started successfully, remove the `[security.encryption.previous-master-key]` section. The old key is no longer needed.
+  </Step>
+</Steps>
+
+```toml
+[security.encryption]
+data-encryption-method = "aes256-ctr"
+data-key-rotation-period = "7d"
+
+[security.encryption.master-key]
+type = "kms"
+key-id = "new-key-id-5678efgh"
+region = "us-west-2"
+
+[security.encryption.previous-master-key]
+type = "kms"
+key-id = "old-key-id-1234abcd"
+region = "us-west-2"
+```
+
+## Log redaction
+
+<ParamField path="security.redact-info-log" type="string | boolean" default="false">
+  Controls whether TiKV redacts user data from log output.
+  - `false` or `"off"` — User data appears in logs as-is.
+  - `true` or `"on"` — User data is replaced with `?` in log output.
+  - `"marker"` — User data is enclosed in `‹...›` markers for post-hoc filtering.
+
+  Enable this setting in environments where logs may be collected by systems that do not have the same data-access controls as TiKV's data directory.
+</ParamField>
+
+```toml
+[security]
+redact-info-log = true
+```
+
+## Security best practices
+
+- **Enable TLS** between all TiKV nodes and between TiDB and TiKV in any environment with network exposure.
+- **Use KMS** as the master key type in production. It keeps the key material off the TiKV host entirely.
+- **Rotate data keys** regularly (`data-key-rotation-period`). The default of `7d` is a reasonable starting point.
+- **Restrict file permissions** on `key-path` and master key files to the user account that runs `tikv-server`.
+- **Enable log redaction** (`redact-info-log = true`) when logs are forwarded to external systems.
+- **Use `cert-allowed-cn`** to restrict which clients and peers TiKV accepts connections from.
+
+## Complete security example
+
+```toml
+[security]
+ca-path   = "/etc/tikv/certs/ca.pem"
+cert-path = "/etc/tikv/certs/server.pem"
+key-path  = "/etc/tikv/certs/server-key.pem"
+cert-allowed-cn = ["tikv-node", "tidb-node"]
+redact-info-log = true
+
+[security.encryption]
+data-encryption-method = "aes256-ctr"
+data-key-rotation-period = "7d"
+
+[security.encryption.master-key]
+type = "kms"
+key-id = "1234abcd-12ab-34cd-56ef-1234567890ab"
+region = "us-west-2"
+```

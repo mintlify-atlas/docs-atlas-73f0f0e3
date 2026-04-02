@@ -1,0 +1,199 @@
+---
+title: "Server configuration"
+description: "Reference for TiKV server, PD, and log configuration options."
+keywords: ["tikv", "configuration", "server", "grpc", "pd", "log"]
+---
+
+The `[server]` section controls network listening, gRPC behavior, and snapshot transfer. The `[pd]` section configures PD endpoint discovery. The `[log]` section controls log level, format, and output.
+
+## [server]
+
+<ParamField path="server.addr" type="string" default='"127.0.0.1:20160"'>
+  The address TiKV listens on for gRPC connections from TiDB and other TiKV
+  peers. Set this to `"0.0.0.0:20160"` to listen on all interfaces.
+</ParamField>
+
+<ParamField path="server.advertise-addr" type="string" default='""'>
+  The address advertised to other cluster members for peer-to-peer communication.
+  When empty, TiKV uses the value of `server.addr`. Set this explicitly when
+  TiKV is behind a NAT or load balancer.
+</ParamField>
+
+<ParamField path="server.status-addr" type="string" default='"127.0.0.1:20180"'>
+  The address of the HTTP status server, which exposes Prometheus metrics and
+  health check endpoints. Set to an empty string to disable the status server.
+
+  <Warning>
+    Do not expose this port to the public internet. It returns internal status
+    information that can reveal cluster topology details.
+  </Warning>
+</ParamField>
+
+<ParamField path="server.max-grpc-send-msg-len" type="integer" default="10485760">
+  Maximum size in bytes of a single gRPC message TiKV can send. Set to `-1` to
+  remove the limit. The default is 10 MiB (10,485,760 bytes).
+
+  Increase this value if you observe `message too large` errors in logs during
+  large scan or backup operations.
+</ParamField>
+
+<ParamField path="server.concurrent-send-snap-limit" type="integer" default="32">
+  Maximum number of snapshot transfers that TiKV can send concurrently. Reduce
+  this value on bandwidth-constrained networks to avoid saturating the link
+  during region rebalancing.
+</ParamField>
+
+<ParamField path="server.concurrent-recv-snap-limit" type="integer" default="32">
+  Maximum number of snapshot transfers that TiKV can receive concurrently.
+  Receiving snapshots is I/O-intensive; lower this value if you observe high
+  disk utilization during region migrations.
+</ParamField>
+
+<ParamField path="server.grpc-concurrency" type="integer">
+  Size of the gRPC server thread pool. The default is computed as
+  `(grpc-raft-conn-num × 3) + 2`, clamped based on available CPU cores. Increase
+  this value on high-concurrency workloads with many client connections.
+</ParamField>
+
+<ParamField path="server.grpc-raft-conn-num" type="integer">
+  Number of gRPC connections maintained between each pair of TiKV nodes for
+  sending Raft messages. The default is computed from CPU quota, clamped between
+  1 and 4. Increasing this value can improve Raft throughput on high-core
+  machines with heavy replication traffic.
+</ParamField>
+
+<ParamField path="server.end-point-recursion-limit" type="integer" default="1000">
+  Maximum recursion depth allowed when decoding a coprocessor DAG expression
+  sent from TiDB. Requests that exceed this depth are rejected with an error.
+  Increase this only if TiDB generates deeply nested expressions for complex
+  queries.
+</ParamField>
+
+<ParamField path="server.labels" type="map">
+  Key-value pairs that describe this TiKV node's physical location. PD uses
+  these labels for placement rules and topology-aware scheduling.
+
+  ```toml
+  [server]
+  labels = { zone = "us-west-2a", rack = "rack-1", disk = "ssd" }
+  ```
+
+  <Tip>
+    Define labels consistently across all TiKV nodes so that PD can enforce
+    isolation constraints such as placing Raft replicas in different availability
+    zones.
+  </Tip>
+</ParamField>
+
+---
+
+## [pd]
+
+<ParamField path="pd.endpoints" type="array of strings" default='["127.0.0.1:2379"]'>
+  List of PD node addresses TiKV connects to for cluster coordination, leader
+  election metadata, and region scheduling. Provide all PD nodes so that TiKV
+  can retry if the current leader is unreachable.
+
+  ```toml
+  [pd]
+  endpoints = [
+    "10.0.1.10:2379",
+    "10.0.1.11:2379",
+    "10.0.1.12:2379",
+  ]
+  ```
+</ParamField>
+
+---
+
+## [log]
+
+<ParamField path="log.level" type="string" default='"info"'>
+  Log verbosity. Accepted values: `"trace"`, `"debug"`, `"info"`, `"warn"`,
+  `"error"`, `"fatal"`. The aliases `"warning"` and `"critical"` are also
+  accepted for compatibility.
+
+  <Note>
+    `"trace"` and `"debug"` levels produce very large log volumes.
+    Use `"info"` in production.
+  </Note>
+</ParamField>
+
+<ParamField path="log.format" type="string" default='"text"'>
+  Log output format. Accepted values: `"text"` (human-readable key=value pairs)
+  or `"json"` (structured JSON, suitable for log aggregation systems).
+</ParamField>
+
+### Slow log
+
+<ParamField path="slow-log-file" type="string" default='""'>
+  Path to the slow log file. When empty, slow log entries are appended to the
+  main log file (`log.file.filename`). If neither `slow-log-file` nor
+  `log.file.filename` is set, slow logs go to stderr.
+
+  Note: `slow-log-file` is a top-level config key, not under `[log]`.
+</ParamField>
+
+<ParamField path="slow-log-threshold" type="duration" default='"1s"'>
+  Operations that take longer than this duration are recorded as slow logs.
+  Accepts duration strings such as `"500ms"` or `"2s"`.
+
+  Note: `slow-log-threshold` is a top-level config key, not under `[log]`.
+</ParamField>
+
+### [log.file]
+
+<ParamField path="log.file.filename" type="string" default='""'>
+  Path to the log file. When empty, TiKV writes logs to `stderr`. Usually set
+  via the command line rather than in the config file.
+</ParamField>
+
+<ParamField path="log.file.max-size" type="integer" default="300">
+  Maximum size of a single log file in megabytes. When the file reaches this
+  size, TiKV rotates it. The upper limit is 4096 MB.
+</ParamField>
+
+<ParamField path="log.file.max-days" type="integer" default="0">
+  Number of days to retain old log files. Set to `0` to keep log files
+  indefinitely.
+</ParamField>
+
+<ParamField path="log.file.max-backups" type="integer" default="0">
+  Maximum number of rotated log files to retain. Set to `0` to keep all
+  rotated files.
+</ParamField>
+
+---
+
+## Example configuration
+
+```toml
+# Top-level slow log settings
+slow-log-file = "/var/log/tikv/tikv-slow.log"
+slow-log-threshold = "1s"
+
+[server]
+addr = "0.0.0.0:20160"
+advertise-addr = "10.0.1.20:20160"
+status-addr = "10.0.1.20:20180"
+max-grpc-send-msg-len = 10485760
+concurrent-send-snap-limit = 32
+concurrent-recv-snap-limit = 32
+grpc-concurrency = 5
+grpc-raft-conn-num = 1
+end-point-recursion-limit = 1000
+labels = { zone = "us-east-1a", rack = "rack-3" }
+
+[pd]
+endpoints = ["10.0.1.10:2379", "10.0.1.11:2379", "10.0.1.12:2379"]
+
+[log]
+level = "info"
+format = "text"
+
+[log.file]
+filename = "/var/log/tikv/tikv.log"
+max-size = 300
+max-days = 7
+max-backups = 10
+```

@@ -1,0 +1,189 @@
+---
+title: 'Build from source'
+description: 'Compile TiKV from source on Linux or macOS using the Rust toolchain.'
+---
+
+Building TiKV from source lets you run development builds, apply local patches, or contribute to the project. TiKV is written in Rust and has C++ dependencies (RocksDB, gRPC), so the build environment requires a few tools beyond a standard Rust installation.
+
+## Prerequisites
+
+Install the following tools before you start:
+
+| Tool | Notes |
+|---|---|
+| `git` | Version control |
+| [`rustup`](https://rustup.rs/) | Rust installer and toolchain manager |
+| `make` | Runs common build workflows |
+| `cmake` | Required to build gRPC |
+| `awk` | Pattern scanning — available on all major platforms |
+| [`protoc`](https://github.com/protocolbuffers/protobuf/releases) | Google Protocol Buffer compiler |
+| C++ compiler | gcc 5+ or clang (required for gRPC and RocksDB) |
+
+If you are targeting a platform other than x86\_64/aarch64 Linux or macOS, you also need `llvm` and `clang` to generate bindings and build native libraries.
+
+<Tip>
+On macOS, install `cmake`, `protoc`, and `gcc`/`llvm` with Homebrew:
+
+```bash
+brew install cmake protobuf llvm
+```
+</Tip>
+
+## Build TiKV
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/tikv/tikv.git
+    cd tikv
+    ```
+
+    All subsequent commands assume you are in the `tikv` directory.
+  </Step>
+
+  <Step title="Configure the Rust toolchain">
+    TiKV is pinned to a specific Rust version via a `rust-toolchain` file. `rustup` and `cargo` read this file automatically. Install the two required components:
+
+    ```bash
+    rustup component add rustfmt
+    rustup component add clippy
+    ```
+  </Step>
+
+  <Step title="Build a development binary">
+    ```bash
+    make build
+    ```
+
+    This produces a debug build of `tikv-server` and `tikv-ctl` under `./target/debug/`. A full build takes several minutes on first run because Rust compiles RocksDB and gRPC from source.
+
+    For a quick iteration loop that checks for errors without producing a binary, run:
+
+    ```bash
+    cargo check --all
+    ```
+  </Step>
+
+  <Step title="Run the built binary">
+    You can start TiKV directly from the build output directory. Combine it with a running PD instance to form a working cluster. See [Deploy with binary](/deploy/binary) for PD setup instructions.
+
+    ```bash
+    ./target/debug/tikv-server \
+      --pd-endpoints="127.0.0.1:2379" \
+      --addr="127.0.0.1:20160" \
+      --data-dir=/tmp/tikv/data \
+      --log-file=/tmp/tikv/log/tikv.log
+    ```
+  </Step>
+</Steps>
+
+## Run tests
+
+<Tabs>
+  <Tab title="Full test suite">
+    ```bash
+    make test
+    ```
+  </Tab>
+  <Tab title="Specific test">
+    Pass the test name as `$TESTNAME`. The `--nocapture` flag shows stdout from the test runner.
+
+    ```bash
+    ./scripts/test $TESTNAME -- --nocapture
+    ```
+
+    Or using `make`:
+
+    ```bash
+    env EXTRA_CARGO_ARGS=$TESTNAME make test
+    ```
+  </Tab>
+  <Tab title="nextest (faster)">
+    [nextest](https://github.com/nextest-rs/nextest) runs tests in parallel and produces cleaner output.
+
+    ```bash
+    env EXTRA_CARGO_ARGS=$TESTNAME make test_with_nextest
+    ```
+  </Tab>
+</Tabs>
+
+## Development workflow
+
+Use `make dev` before opening a pull request. It formats the code, runs Clippy, and then runs the full test suite:
+
+```bash
+make dev
+```
+
+You can also run each step individually:
+
+```bash
+# Format code with Rustfmt
+make format
+
+# Run Clippy lints
+make clippy
+```
+
+<Warning>
+Use `make clippy` instead of `cargo clippy` directly. The Makefile passes additional flags that suppress known false positives.
+</Warning>
+
+## Build options
+
+### Reduce compilation time
+
+TiKV debug builds omit full debugging information by default to keep build times and disk usage low. Only test packages include line-level debug info.
+
+To add line numbers to stack traces, prefix your build command with `RUSTFLAGS=-Cdebuginfo=1`:
+
+```bash
+RUSTFLAGS=-Cdebuginfo=1 make build
+RUSTFLAGS=-Cdebuginfo=1 cargo build
+```
+
+For full debug info (larger binaries, longer compile):
+
+```bash
+RUSTFLAGS=-Cdebuginfo=2 make build
+```
+
+### Enable build pipelining
+
+When you invoke `cargo` directly (rather than through `make`), enable pipelined compilation to match the parallelism that `make` uses:
+
+```bash
+CARGO_BUILD_PIPELINING=true cargo build
+```
+
+### Release build
+
+To produce an optimized binary suitable for benchmarking:
+
+```bash
+make release
+```
+
+The release binary is written to `./target/release/tikv-server`.
+
+## Run tests inside Docker
+
+If you prefer an isolated environment, you can run the unit test suite inside a container. The command builds the `pingcap/tikv_dev` image on the first run and then executes the tests:
+
+```bash
+make docker_test
+```
+
+<Note>
+You may see lines like `<jemalloc>: Invalid conf pair: prof:true` in the output. These come from Rust's allocator integration and are not errors.
+</Note>
+
+## Open file limit
+
+TiKV opens many files concurrently. Before running a local instance, raise the open file descriptor limit:
+
+```bash
+ulimit -n 82920
+```
+
+Add this to your shell profile to make it persistent. WSL2 users may need to follow additional steps — see the [relevant WSL issue](https://github.com/Microsoft/WSL/issues/1688#issuecomment-532767317) for details.

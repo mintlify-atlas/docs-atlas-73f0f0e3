@@ -1,0 +1,212 @@
+---
+title: "Backup and restore"
+description: "How to back up and restore TiKV data using BR, external storage backends, and point-in-time recovery with log backup streaming."
+keywords: ["backup", "restore", "BR", "PITR", "point-in-time recovery", "S3", "GCS", "Azure", "log backup", "streaming backup", "MVCC"]
+---
+
+TiKV supports two complementary backup strategies: **full backup** using the BR (Backup & Restore) tool, and **log backup** for point-in-time recovery (PITR). Both strategies write data to external object storage.
+
+## External storage backends
+
+TiKV's `external_storage` component (`components/external_storage/`) provides a unified `ExternalStorage` trait that abstracts over all supported backends.
+
+<Tabs>
+  <Tab title="Amazon S3">
+    ```toml
+    [backup]
+    # S3 is configured via the BR tool or API request, not tikv.toml directly.
+    # The s3_multi_part_size controls multipart upload chunk size.
+    s3-multi-part-size = "5MiB"
+    ```
+
+    When using BR, pass S3 parameters on the command line:
+
+    ```bash
+    br backup full \
+      --pd "127.0.0.1:2379" \
+      --storage "s3://my-bucket/backup-20260402" \
+      --s3.region "us-east-1"
+    ```
+  </Tab>
+  <Tab title="Google Cloud Storage">
+    ```bash
+    br backup full \
+      --pd "127.0.0.1:2379" \
+      --storage "gcs://my-bucket/backup-20260402" \
+      --gcs.credentials-file "/path/to/service-account.json"
+    ```
+
+    <Note>
+    TiKV supports two GCS client implementations. Set `gcp-v2-enable = true` in `[log-backup]` to use the newer GCS v2 backend for log backup.
+    </Note>
+  </Tab>
+  <Tab title="Azure Blob Storage">
+    ```bash
+    br backup full \
+      --pd "127.0.0.1:2379" \
+      --storage "azure://my-container/backup-20260402" \
+      --azure.account-name "mystorageaccount" \
+      --azure.account-key "base64encodedkey=="
+    ```
+  </Tab>
+  <Tab title="Local filesystem">
+    ```bash
+    br backup full \
+      --pd "127.0.0.1:2379" \
+      --storage "local:///data/backup-20260402"
+    ```
+
+    <Warning>
+    Local storage is only suitable for single-node testing. In production, use object storage so that backups survive node failures.
+    </Warning>
+  </Tab>
+</Tabs>
+
+## Full backup
+
+A full backup takes an MVCC snapshot of the entire cluster at a given timestamp. BR coordinates with PD to obtain a consistent backup timestamp, then instructs each TiKV store to scan its key ranges and write SST files to the target storage.
+
+### Consistency guarantee
+
+Because TiKV uses MVCC, all data written at or before the backup timestamp is included and internally consistent. BR records the backup timestamp in the backup metadata; restore always brings the cluster back to this exact point.
+
+### Run a full backup
+
+<Steps>
+  <Step title="Verify cluster health">
+    Confirm that all TiKV stores are online and that PD reports no offline or tombstone stores before starting a backup.
+
+    ```bash
+    pd-ctl -u http://127.0.0.1:2379 store
+    ```
+  </Step>
+  <Step title="Run BR backup">
+    ```bash
+    br backup full \
+      --pd "127.0.0.1:2379" \
+      --storage "s3://my-bucket/full-backup-20260402" \
+      --s3.region "us-east-1" \
+      --log-file /var/log/br.log
+    ```
+
+    BR prints progress and the backup timestamp when it finishes.
+  </Step>
+  <Step title="Verify the backup">
+    ```bash
+    br validate checksum \
+      --pd "127.0.0.1:2379" \
+      --storage "s3://my-bucket/full-backup-20260402" \
+      --s3.region "us-east-1"
+    ```
+  </Step>
+</Steps>
+
+## Log backup (PITR)
+
+Log backup continuously streams CDC (Change Data Capture) events from TiKV to external storage. Combined with a periodic full backup, this lets you restore to any point in time, not just the moment of the last full backup.
+
+The `backup-stream` component (`components/backup-stream/`) implements log backup inside TiKV. It registers a Raft observer (`BackupStreamObserver`) that captures mutations as they are applied to the state machine, converts them to stream events, buffers them in temporary files on the local disk, and periodically flushes them to external storage.
+
+### How log backup works
+
+<Steps>
+  <Step title="Start a log backup task">
+    BR creates a task descriptor in PD's etcd-backed metadata store. Each TiKV node watches for task changes and registers a CDC observer for the covered key ranges.
+  </Step>
+  <Step title="Capture CDC events">
+    As Raft log entries are applied, the observer captures write mutations and converts them to stream events. Events are grouped by region and buffered in local temporary files (`log-backup.temp-path`).
+  </Step>
+  <Step title="Flush to external storage">
+    A background flush tick runs at the interval set by `log-backup.max-flush-interval` (minimum 10 s). When the tick fires or a temporary file exceeds `log-backup.file-size-limit`, TiKV uploads the file to the configured external storage.
+  </Step>
+  <Step title="Advance the checkpoint">
+    Each TiKV store reports its flush progress to PD's checkpoint manager. PD tracks the minimum checkpoint timestamp across all stores. This global checkpoint advances only when all stores have flushed data up to that point.
+  </Step>
+</Steps>
+
+### Log backup configuration
+
+Configure log backup in `tikv.toml` under the `[log-backup]` section.
+
+```toml
+[log-backup]
+enable = true
+temp-path = "/data/tikv/log-backup-tmp"
+max-flush-interval = "3m"        # must be >= 10s
+min-ts-interval = "1m"           # must be >= 1s; how often to advance resolved-ts
+num-threads = 4                  # defaults to number of CPU cores
+file-size-limit = "256MiB"       # flush when a temp file exceeds this size
+initial-scan-rate-limit = "60MiB" # bandwidth cap for initial region scanning
+initial-scan-concurrency = 6     # concurrent initial scans
+s3-multi-part-size = "5MiB"      # multipart upload chunk size for S3
+```
+
+### Start a log backup task
+
+```bash
+br log start \
+  --pd "127.0.0.1:2379" \
+  --storage "s3://my-bucket/log-backup" \
+  --s3.region "us-east-1" \
+  --task-name "my-pitr-task"
+```
+
+### Check log backup status
+
+```bash
+br log status \
+  --pd "127.0.0.1:2379" \
+  --task-name "my-pitr-task"
+```
+
+The output shows the global checkpoint timestamp. PITR is possible for any timestamp between the full backup timestamp and the checkpoint.
+
+## Restore
+
+### Full restore
+
+```bash
+br restore full \
+  --pd "127.0.0.1:2379" \
+  --storage "s3://my-bucket/full-backup-20260402" \
+  --s3.region "us-east-1"
+```
+
+<Warning>
+Restore overwrites data on the target cluster. Always restore to a fresh or empty cluster unless you are intentionally merging data.
+</Warning>
+
+### Point-in-time restore
+
+To restore to a specific timestamp, provide both the full backup path and the log backup path.
+
+```bash
+br restore point \
+  --pd "127.0.0.1:2379" \
+  --storage "s3://my-bucket/log-backup" \
+  --full-backup-storage "s3://my-bucket/full-backup-20260402" \
+  --s3.region "us-east-1" \
+  --restored-ts "436808831514509321"
+```
+
+BR first restores the full backup SSTs, then replays log backup events up to the target timestamp.
+
+## Important considerations
+
+<AccordionGroup>
+  <Accordion title="MVCC snapshot consistency">
+    A full backup captures a consistent MVCC snapshot. All rows within the backup reflect their state at the backup timestamp. Rows written after the backup timestamp are not included, even if they were committed before the backup finished scanning that key range.
+  </Accordion>
+  <Accordion title="GC safe point and backup">
+    PD coordinates the GC safe point. While a backup is running, BR registers a safe point hold to prevent GC from advancing past the backup timestamp. If a backup takes a very long time, older MVCC versions accumulate. Monitor `tikv_gcworker_gc_tasks_vec` to ensure GC resumes after the backup completes.
+  </Accordion>
+  <Accordion title="Storage credentials and IAM">
+    TiKV nodes write backup files directly to external storage, not through BR. Each TiKV node needs access to the storage backend. For S3, attach an IAM role to each node or distribute credentials through environment variables. For GCS, use a service account key file accessible on each node.
+  </Accordion>
+  <Accordion title="Network bandwidth">
+    A full backup of a large cluster generates significant outbound traffic from all TiKV stores simultaneously. Plan storage network bandwidth accordingly and consider scheduling backups during low-traffic periods.
+  </Accordion>
+  <Accordion title="Temporary disk space for log backup">
+    Log backup buffers events in local temporary files before flushing. Ensure the `log-backup.temp-path` directory has enough space to hold unflushed events. The directory should be on a fast local disk, not the same partition as RocksDB data files.
+  </Accordion>
+</AccordionGroup>

@@ -1,0 +1,312 @@
+---
+title: "Storage engine configuration"
+description: "Reference for TiKV storage, RocksDB, Titan, and RaftDB configuration options."
+keywords: ["tikv", "configuration", "rocksdb", "titan", "storage", "raftdb", "column family"]
+---
+
+TiKV uses RocksDB as its underlying key-value storage engine. The `[storage]` section
+controls data placement and scheduler behavior. The `[rocksdb]` section tunes the
+main KV engine, including per-column-family options. The `[rocksdb.titan]` section
+enables the Titan large-value store. The `[raftdb]` section configures the separate
+RocksDB instance used for Raft logs (when Raft Engine is disabled).
+
+---
+
+## [storage]
+
+<ParamField path="storage.data-dir" type="string" default='""./"'>
+  Directory where TiKV stores RocksDB SST files and other persistent data.
+  Point this at a dedicated disk with sufficient capacity and I/O performance.
+
+  <Tip>
+    Place `storage.data-dir` and `raftstore.raftdb-path` on separate physical
+    disks to reduce I/O contention between KV writes and Raft log writes.
+  </Tip>
+</ParamField>
+
+<ParamField path="storage.capacity" type="string">
+  Maximum data size this TiKV store will hold. When unset, TiKV uses the full
+  disk capacity. Accepts human-readable sizes such as `"500GB"`.
+</ParamField>
+
+<ParamField path="storage.reserve-space" type="string" default='"5GB"'>
+  Disk space reserved to ensure that TiKV can recover from a "no space left"
+  condition. TiKV reserves `max(reserve-space, capacity × 5%)`. Set to `"0B"`
+  only in test environments.
+</ParamField>
+
+<ParamField path="storage.scheduler-concurrency" type="integer" default="524288">
+  Number of slots in the scheduler latch table. This value controls write
+  concurrency by determining how many in-flight write transactions can be
+  tracked simultaneously. Increase this when importing large datasets.
+</ParamField>
+
+<ParamField path="storage.scheduler-worker-pool-size" type="integer" default="4">
+  Number of threads in the scheduler worker pool (write threads). Set this to
+  a value less than the total number of CPU cores. Monitor the
+  `sched-worker-pool` threads with `top -H -p <tikv-pid>` and increase this
+  value if they are consistently busy.
+</ParamField>
+
+<ParamField path="storage.scheduler-pending-write-threshold" type="string" default='"100MB"'>
+  When the pending write byte count exceeds this threshold, TiKV returns a
+  `scheduler too busy` error to callers. Increase this on write-heavy workloads
+  if clients see transient busy errors.
+</ParamField>
+
+### [storage.block-cache]
+
+<ParamField path="storage.block-cache.capacity" type="string">
+  Size of the shared RocksDB block cache, which stores uncompressed blocks from
+  all column families. Tune this to 30–50% of total system memory.
+
+  - Default for `raft-kv` engine: 45% of available system memory.
+  - Default for `partitioned-raft-kv` engine: 30% of available system memory.
+
+  <Warning>
+    When you deploy multiple TiKV nodes on a single machine, set this value
+    explicitly. Otherwise, each instance independently estimates available memory
+    and the total may exceed physical RAM, causing OOM.
+  </Warning>
+</ParamField>
+
+---
+
+## [rocksdb]
+
+These options apply to the main KV RocksDB instance that stores user data.
+
+<ParamField path="rocksdb.max-background-jobs" type="integer" default="8">
+  Maximum number of background threads for RocksDB compaction and flush
+  operations. The default is `min(8, CPU_NUM - 1)`. Increase this when
+  importing large datasets to prevent write stalls, but keep it below the
+  total CPU core count.
+</ParamField>
+
+<ParamField path="rocksdb.max-background-flushes" type="integer" default="2">
+  Maximum number of threads dedicated to flushing memtables to disk. The
+  default is `max(2, max-background-jobs / 4)`. Flushing is latency-sensitive;
+  insufficient flush threads cause write stalls when memtables fill up.
+</ParamField>
+
+<ParamField path="rocksdb.max-open-files" type="integer" default="40960">
+  Maximum number of SST file handles kept open. Set to `-1` to keep all files
+  open permanently (RocksDB preloads index and filter blocks into the block
+  cache at startup). Increase this value for large databases with many SST
+  files.
+</ParamField>
+
+<ParamField path="rocksdb.bytes-per-sync" type="string" default='"1MB"'>
+  Controls incremental background syncing of data files to disk. RocksDB
+  asynchronously syncs up to this many bytes at a time, smoothing I/O rather
+  than issuing large, bursty `fsync` calls.
+</ParamField>
+
+<ParamField path="rocksdb.wal-dir" type="string" default='""'>
+  Absolute path for RocksDB WAL (Write-Ahead Log) files. When empty, WAL files
+  are stored in the same directory as SST data. Storing WAL on a separate disk
+  from SST data can improve write performance.
+
+  <Warning>
+    Do not set `rocksdb.wal-dir` and `raftdb.wal-dir` to the same directory.
+  </Warning>
+</ParamField>
+
+---
+
+## Column family options
+
+TiKV organizes data across three RocksDB column families. Configure each under
+its respective section. Options not listed here inherit the default value shown
+in the `[rocksdb.defaultcf]` block.
+
+<AccordionGroup>
+  <Accordion title="[rocksdb.defaultcf] — user data">
+    Stores actual user key-value data. This column family typically contains the
+    largest volume of data.
+
+    <ParamField path="rocksdb.defaultcf.block-size" type="string" default='"32KB"'>
+      Size of an uncompressed data block. RocksDB compresses and caches data at
+      the block level. Larger blocks improve sequential scan throughput but
+      increase read amplification for point lookups.
+    </ParamField>
+
+    <ParamField path="rocksdb.defaultcf.bloom-filter-bits-per-key" type="integer" default="10">
+      Number of bits per key used by the bloom filter. Higher values reduce false
+      positives (and unnecessary disk reads) at the cost of more memory. The
+      default yields approximately 1% false positive rate.
+    </ParamField>
+
+    <ParamField path="rocksdb.defaultcf.compression-per-level" type="array of strings" default='["no", "no", "lz4", "lz4", "lz4", "zstd", "zstd"]'>
+      Compression algorithm applied to each LSM level (L0 through L6). `"no"`
+      means no compression; `"lz4"` offers moderate speed and ratio; `"zstd"`
+      offers higher compression at greater CPU cost.
+
+      Tune this based on your I/O vs. CPU trade-off:
+      - High I/O pressure, spare CPU: compress lower levels (e.g. `"lz4:lz4:lz4:..."`).
+      - Low I/O, high CPU: leave lower levels uncompressed (e.g. `"no:no:lz4:..."`).
+    </ParamField>
+
+    <ParamField path="rocksdb.defaultcf.write-buffer-size" type="string" default='"128MB"'>
+      Size of a single memtable. When the active memtable reaches this size, it
+      becomes read-only and a new memtable is created. The old memtable is then
+      flushed to a level-0 SST file.
+    </ParamField>
+
+    <ParamField path="rocksdb.defaultcf.max-write-buffer-number" type="integer" default="5">
+      Maximum number of memtables (active + immutable) that can exist at once.
+      When flush threads cannot keep up and this limit is reached, RocksDB stalls
+      new writes. Increase this during bulk import to absorb write bursts.
+    </ParamField>
+  </Accordion>
+
+  <Accordion title="[rocksdb.writecf] — MVCC commit records">
+    Stores MVCC write records that track transaction commit metadata.
+
+    <ParamField path="rocksdb.writecf.block-size" type="string" default='"32KB"'>
+      Block size for the write column family. Keep this consistent with
+      `rocksdb.defaultcf.block-size`.
+    </ParamField>
+
+    <ParamField path="rocksdb.writecf.compression-per-level" type="array of strings" default='["no", "no", "lz4", "lz4", "lz4", "zstd", "zstd"]'>
+      Per-level compression for the write column family. Recommended to match
+      `rocksdb.defaultcf.compression-per-level`.
+    </ParamField>
+
+    <ParamField path="rocksdb.writecf.write-buffer-size" type="string" default='"128MB"'>
+      Memtable size for the write column family. Recommended to match
+      `rocksdb.defaultcf.write-buffer-size`.
+    </ParamField>
+
+    <ParamField path="rocksdb.writecf.max-write-buffer-number" type="integer" default="5">
+      Maximum memtable count for the write column family.
+    </ParamField>
+  </Accordion>
+
+  <Accordion title="[rocksdb.lockcf] — pessimistic lock records">
+    Stores pessimistic transaction lock records. This column family is
+    typically small and write-intensive with short-lived keys.
+
+    <ParamField path="rocksdb.lockcf.block-size" type="string" default='"16KB"'>
+      Block size for the lock column family. The smaller default is appropriate
+      because lock records are small and frequently accessed.
+    </ParamField>
+
+    <ParamField path="rocksdb.lockcf.compression-per-level" type="array of strings" default='["no", "no", "no", "no", "no", "no", "no"]'>
+      No compression is applied by default because lock records are short-lived
+      and compression overhead is rarely worth it.
+    </ParamField>
+
+    <ParamField path="rocksdb.lockcf.write-buffer-size" type="string" default='"32MB"'>
+      Memtable size for the lock column family. Smaller than `defaultcf` because
+      lock records are ephemeral.
+    </ParamField>
+
+    <ParamField path="rocksdb.lockcf.max-write-buffer-number" type="integer" default="5">
+      Maximum memtable count for the lock column family.
+    </ParamField>
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## [rocksdb.titan]
+
+Titan is a key-value separation plugin for RocksDB that stores large values in
+separate blob files, reducing write amplification for wide-value workloads.
+
+<Note>
+  Titan is enabled by default since TiKV v7.6.0 for new clusters. Once enabled,
+  you cannot disable it by simply setting `enabled = false`. To disable Titan on
+  a running cluster, set `blob-run-mode = "fallback"`, perform a full compaction
+  with `tikv-ctl`, and only then set `enabled = false` after blob files drain to
+  zero.
+</Note>
+
+<ParamField path="rocksdb.defaultcf.titan.min-blob-size" type="string" default='"32KB"'>
+  Values larger than this threshold are written to Titan blob files instead of
+  inline in the LSM tree. Smaller values remain in RocksDB base storage.
+
+  The default is 32 KB for new clusters created at v7.6.0 or later. Clusters
+  upgraded from earlier versions retain their existing effective value.
+</ParamField>
+
+<ParamField path="rocksdb.defaultcf.titan.blob-file-compression" type="string" default='"zstd"'>
+  Compression algorithm applied to data stored in Titan blob files. Accepted
+  values: `"no"`, `"snappy"`, `"zlib"`, `"bzip2"`, `"lz4"`, `"lz4hc"`,
+  `"zstd"`.
+</ParamField>
+
+<ParamField path="rocksdb.defaultcf.titan.discardable-ratio" type="float" default="0.5">
+  When the proportion of garbage (overwritten or deleted values) in a blob file
+  exceeds this ratio, Titan schedules the file for GC. Lower values trigger more
+  frequent GC and reclaim space earlier at higher write cost; higher values
+  reduce GC frequency at the cost of space amplification.
+</ParamField>
+
+---
+
+## [raftdb]
+
+`raftdb` is a separate RocksDB instance used to persist Raft logs. It is active
+only when `raft-engine.enable = false`. For most deployments, use Raft Engine
+(the default) instead.
+
+<ParamField path="raftdb.max-background-jobs" type="integer" default="4">
+  Maximum number of background compaction and flush threads for the Raft log
+  RocksDB instance.
+</ParamField>
+
+<ParamField path="raftdb.wal-dir" type="string" default='""'>
+  Absolute path for the Raft RocksDB WAL directory. When empty, WAL files
+  reside in the same directory as Raft SST data.
+
+  <Warning>
+    Do not set `raftdb.wal-dir` and `rocksdb.wal-dir` to the same path.
+  </Warning>
+</ParamField>
+
+---
+
+## Example configuration
+
+```toml
+[storage]
+data-dir = "/data/tikv"
+reserve-space = "5GB"
+scheduler-concurrency = 524288
+scheduler-worker-pool-size = 4
+scheduler-pending-write-threshold = "100MB"
+
+[storage.block-cache]
+capacity = "16GB"
+
+[rocksdb]
+max-background-jobs = 8
+max-background-flushes = 2
+max-open-files = 40960
+bytes-per-sync = "1MB"
+
+[rocksdb.defaultcf]
+block-size = "32KB"
+bloom-filter-bits-per-key = 10
+compression-per-level = ["no", "no", "lz4", "lz4", "lz4", "zstd", "zstd"]
+write-buffer-size = "128MB"
+max-write-buffer-number = 5
+
+[rocksdb.writecf]
+compression-per-level = ["no", "no", "lz4", "lz4", "lz4", "zstd", "zstd"]
+write-buffer-size = "128MB"
+max-write-buffer-number = 5
+
+[rocksdb.lockcf]
+write-buffer-size = "32MB"
+
+[rocksdb.defaultcf.titan]
+min-blob-size = "32KB"
+blob-file-compression = "zstd"
+discardable-ratio = 0.5
+
+[raftdb]
+max-background-jobs = 4
+```

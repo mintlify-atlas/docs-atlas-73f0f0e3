@@ -1,0 +1,186 @@
+---
+title: 'Deploy with Docker Compose'
+description: 'Run a full 3 PD + 3 TiKV node cluster on a single machine using Docker Compose and pre-built nightly images.'
+---
+
+The Docker Compose setup gives you a complete, production-topology TiKV cluster — three PD nodes and three TiKV nodes — with no compilation required. It uses the official `pingcap/pd:nightly` and `pingcap/tikv:nightly` images from Docker Hub.
+
+<Note>
+On macOS, Docker Desktop ships `docker compose` (with a space) rather than `docker-compose` (with a hyphen). Replace `docker-compose` with `docker compose` in every command below if you are on macOS.
+</Note>
+
+## Prerequisites
+
+- Docker Engine 20.10 or later
+- Docker Compose v2 (or `docker-compose` 1.29+)
+- 10 GB of available disk space for data volumes
+
+## Start the cluster
+
+<Steps>
+  <Step title="Clone the TiKV repository">
+    The `docker-compose.yml` file lives in the root of the TiKV repository.
+
+    ```bash
+    git clone https://github.com/tikv/tikv.git
+    cd tikv
+    ```
+  </Step>
+
+  <Step title="Start all services">
+    Bring up all six containers in detached mode. Docker Compose pulls the PD and TiKV images automatically on the first run.
+
+    ```bash
+    docker-compose up -d
+    ```
+
+    Docker Compose starts all three PD nodes simultaneously so they can hold a Raft leader election, then waits for all three PD health checks to pass before starting the TiKV nodes.
+  </Step>
+
+  <Step title="Check cluster status">
+    Confirm every container is running and healthy.
+
+    ```bash
+    docker-compose ps
+    ```
+
+    All six services — `tikv-pd1`, `tikv-pd2`, `tikv-pd3`, `tikv-tikv1`, `tikv-tikv2`, `tikv-tikv3` — should show a `healthy` status. If TiKV containers show `starting`, wait 30–60 seconds for the PD cluster to finish bootstrapping.
+  </Step>
+
+  <Step title="Verify TiKV status">
+    Each TiKV node exposes a status endpoint. Query any of them to confirm the node is running:
+
+    ```bash
+    curl http://localhost:20181/status
+    curl http://localhost:20182/status
+    curl http://localhost:20183/status
+    ```
+  </Step>
+</Steps>
+
+## Service ports
+
+### PD (Placement Driver)
+
+| Container | Client API | Peer |
+|---|---|---|
+| `tikv-pd1` | `127.0.0.1:23791` | `127.0.0.1:23801` |
+| `tikv-pd2` | `127.0.0.1:23792` | `127.0.0.1:23802` |
+| `tikv-pd3` | `127.0.0.1:23793` | `127.0.0.1:23803` |
+
+### TiKV
+
+| Container | Server port | Status port |
+|---|---|---|
+| `tikv-tikv1` | `127.0.0.1:20161` | `127.0.0.1:20181` |
+| `tikv-tikv2` | `127.0.0.1:20162` | `127.0.0.1:20182` |
+| `tikv-tikv3` | `127.0.0.1:20163` | `127.0.0.1:20183` |
+
+## Connect to the cluster
+
+Use any PD client URL as the endpoint for TiKV clients. The example below uses the Python client:
+
+```bash
+pip3 install -i https://test.pypi.org/simple/ tikv-client
+```
+
+```python
+from tikv_client import RawClient
+
+# Connect using any PD endpoint
+client = RawClient.connect(["127.0.0.1:23791"])
+
+client.put(b'foo', b'bar')
+print(client.get(b'foo'))  # b'bar'
+```
+
+You can also open the PD dashboard in a browser:
+
+- http://localhost:23791/dashboard
+- http://localhost:23792/dashboard
+- http://localhost:23793/dashboard
+
+## View logs
+
+<Tabs>
+  <Tab title="docker-compose logs">
+    Stream all service logs:
+
+    ```bash
+    docker-compose logs -f
+    ```
+
+    Stream logs for a specific service:
+
+    ```bash
+    docker-compose logs -f tikv1
+    docker-compose logs -f pd1
+    ```
+  </Tab>
+  <Tab title="Log files inside containers">
+    Each container writes structured logs to a file mounted from a Docker volume.
+
+    ```bash
+    # Follow PD logs in real time
+    docker exec tikv-pd1 tail -f /logs/pd.log
+
+    # Follow TiKV logs in real time
+    docker exec tikv-tikv1 tail -f /logs/tikv.log
+
+    # View last 100 lines
+    docker exec tikv-pd1 tail -n 100 /logs/pd.log
+    docker exec tikv-tikv1 tail -n 100 /logs/tikv.log
+    ```
+  </Tab>
+</Tabs>
+
+## Stop and clean up
+
+Stop all containers without removing data:
+
+```bash
+docker-compose down
+```
+
+Stop all containers and remove all data volumes (clean slate):
+
+```bash
+docker-compose down -v
+```
+
+## Troubleshooting
+
+### PD startup warnings about "server not started"
+
+When the cluster first starts, you may see warnings like:
+
+```
+[WARN] ["region sync with leader meet error"]
+[WARN] ["cluster is not bootstrapped"]
+```
+
+These are expected. PD needs the first TiKV node to connect in order to bootstrap the cluster. The warnings stop automatically once TiKV nodes start and register with PD. Wait 30–60 seconds after all containers show `healthy`.
+
+### Docker memory limits on macOS
+
+If you use Docker Desktop on macOS and see containers exiting unexpectedly, increase the memory limit in **Settings → Resources → Advanced** to at least 4 GB. Running six containers concurrently requires enough headroom for RocksDB and Raft state.
+
+### Check cluster health via the PD API
+
+```bash
+curl http://localhost:23791/pd/api/v1/health
+```
+
+This returns the health status of every PD member. All members should show `"health": true`.
+
+### Restart a single service
+
+```bash
+docker-compose restart tikv1
+```
+
+### Open a shell inside a container
+
+```bash
+docker exec -it tikv-tikv1 /bin/bash
+```
